@@ -6,7 +6,6 @@
 
 > A modern solution for educational institutions combining RFID card authentication with face recognition technology for student identity management, attendance tracking, wallet transactions, library services, and transportation monitoring.
 
-![Application Screenshot](./assets/screenshot.png)
 
 ## 📋 Table of Contents
 
