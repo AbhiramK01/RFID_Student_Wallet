@@ -138,10 +138,7 @@ The main menu provides access to all modules:
 - **Bus**: Track transportation
 - **Student**: Access individual student portal
 
-### Test Accounts
-For testing, you can use these credentials:
-- Admin: admin@school.edu / password
-- Student: student@school.edu / student123
+### 👨‍💻 Admin RFID for accessing and creating accounts is _0006435835_
 
 ## ⚙️ Configuration
 
@@ -164,7 +161,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the terms of the [MIT License](https://github.com/your-username/your-repo/blob/main/LICENSE).
 
 ---
 
