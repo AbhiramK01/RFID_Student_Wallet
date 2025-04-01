@@ -1,6 +1,6 @@
 # RFID Student Wallet Application
 
-> A student management system combining simulated RFID card authentication with face recognition technology.
+> A student management system combining RFID card authentication with face recognition technology.
 
 ## 📋 Features
 
