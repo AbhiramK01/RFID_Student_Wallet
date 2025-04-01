@@ -1,0 +1,23 @@
+LIBRARY CATALOG
+Generated: 2025-03-31 23:32:50
+
+
+COMPUTER SCIENCE
+--------------------------------------------------------------------------------
+ID         Title                                    Author                    Status     Qty
+--------------------------------------------------------------------------------
+B002       Database Management Systems              Mary Johnson              Available  1
+CS1        Hello World                              AK                        Available  1
+B001       Introduction to Python Programming       John Smith                Borrowed   1
+
+ELECTRICAL ENGINEERING
+--------------------------------------------------------------------------------
+ID         Title                                    Author                    Status     Qty
+--------------------------------------------------------------------------------
+B003       Circuit Analysis                         Robert Williams           Available  1
+
+MECHANICAL ENGINEERING
+--------------------------------------------------------------------------------
+ID         Title                                    Author                    Status     Qty
+--------------------------------------------------------------------------------
+B004       Thermodynamics Fundamentals              James Wilson              Available  1
