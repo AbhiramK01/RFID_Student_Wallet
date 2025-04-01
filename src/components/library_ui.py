@@ -3,7 +3,7 @@ from tkinter import ttk, messagebox, filedialog
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils import validate_rfid, validate_pin, get_student_by_rfid, get_similar_books
+from utils import validate_rfid, validate_pin, get_student_by_rfid, get_similar_books, get_book_recommendations
 import datetime
 from google.cloud import firestore
 import csv
@@ -273,8 +273,8 @@ class LibraryUI:
             })
             
             # Create lending record
-            record_data = {
-                'book_id': self.book_data.get('book_id'),  # Use book_id field
+            lending_data = {
+                'book_id': self.book_data.get('book_id', self.book_data['id']),  # Use book_id field or document ID
                 'book_title': self.book_data.get('title', 'Unknown'),
                 'student_id': self.student_data['id'],
                 'student_name': self.student_data.get('name', 'Unknown'),
@@ -285,21 +285,15 @@ class LibraryUI:
                 'timestamp': now
             }
             
-            self.db.collection('library_records').add(record_data)
+            # Add to lendings collection (new approach)
+            self.db.collection('lendings').add(lending_data)
+            
+            # Also add to library_records for backward compatibility
+            self.db.collection('library_records').add(lending_data)
             
             # Show success message
             messagebox.showinfo("Success", 
                               f"Book '{self.book_data.get('title')}' successfully lent to {self.student_data.get('name')}.\nDue date: {due_date}")
-            
-            # Get book recommendations
-            similar_books = get_similar_books(self.db, self.book_data.get('book_id'))
-            
-            if similar_books:
-                recommendation_text = "Reader recommendations:\n"
-                for book in similar_books:
-                    recommendation_text += f"• {book.get('title')} by {book.get('author')}\n"
-                
-                messagebox.showinfo("Book Recommendations", recommendation_text)
             
             # Return to library menu
             self.show_library_menu()
@@ -308,7 +302,7 @@ class LibraryUI:
             messagebox.showerror("Error", f"Failed to process lending: {e}")
     
     def show_return_ui(self):
-        """Show interface to return a book"""
+        """Show the book return interface"""
         # Clear the window
         for widget in self.root.winfo_children():
             widget.destroy()
@@ -317,191 +311,573 @@ class LibraryUI:
         return_frame.pack(fill=tk.BOTH, expand=True)
         
         # Title
-        title_label = ttk.Label(return_frame, text="Return Book", font=('Arial', 16, 'bold'))
-        title_label.pack(pady=(0, 20))
+        self.title_label = ttk.Label(return_frame, text="Return Book", font=('Arial', 16, 'bold'))
+        self.title_label.pack(pady=(0, 20))
+        
+        # Initialize book data
+        self.return_book_data = None
         
         # Book ID input
-        book_frame = ttk.Frame(return_frame)
-        book_frame.pack(fill=tk.X, pady=10)
+        input_frame = ttk.Frame(return_frame)
+        input_frame.pack(fill=tk.X, pady=10)
         
-        book_label = ttk.Label(book_frame, text="Book ID:")
-        book_label.pack(side=tk.LEFT, padx=5)
+        ttk.Label(input_frame, text="Book ID:").pack(side=tk.LEFT, padx=5)
         
-        self.return_book_entry = ttk.Entry(book_frame, width=15)
-        self.return_book_entry.pack(side=tk.LEFT, padx=5)
-        self.return_book_entry.focus()
+        self.return_book_id_entry = ttk.Entry(input_frame, width=20)
+        self.return_book_id_entry.pack(side=tk.LEFT, padx=5)
+        self.return_book_id_entry.focus()
         
-        find_book_btn = ttk.Button(book_frame, text="Find Book", 
+        find_btn = ttk.Button(input_frame, text="Find Book", 
                                   command=self.find_book_to_return)
-        find_book_btn.pack(side=tk.LEFT, padx=5)
+        find_btn.pack(side=tk.LEFT, padx=5)
         
-        # Book info display (will be populated after search)
-        self.return_info_frame = ttk.Frame(return_frame)
-        self.return_info_frame.pack(fill=tk.X, pady=10)
+        # Book information display area
+        self.return_info_frame = ttk.LabelFrame(return_frame, text="Book Information", padding=10)
+        self.return_info_frame.pack(fill=tk.BOTH, expand=True, pady=10)
         
-        # Process button (initially disabled)
+        # Initially, display a message
+        ttk.Label(self.return_info_frame, text="Enter a Book ID to find a book").pack(pady=20)
+        
+        # Process return button
         self.process_return_btn = ttk.Button(return_frame, text="Process Return", 
-                                           command=self.process_return, state=tk.DISABLED)
-        self.process_return_btn.pack(pady=10)
+                                           command=self.process_return,
+                                           state=tk.DISABLED)
+        self.process_return_btn.pack(pady=20)
         
         # Back button
         back_btn = ttk.Button(return_frame, text="Back", 
                              command=self.show_library_menu)
-        back_btn.pack(pady=(20, 0))
-        
-        # Store book data
-        self.return_book_data = None
+        back_btn.pack(pady=(0, 10))
     
     def find_book_to_return(self):
-        """Find a book by ID for returning"""
-        book_id = self.return_book_entry.get().strip()
+        """Find a book to return"""
+        book_id = self.return_book_id_entry.get().strip()
         
         if not book_id:
-            messagebox.showerror("Invalid Input", "Please enter a Book ID.")
+            messagebox.showerror("Error", "Please enter a Book ID")
             return
         
-        # Clear previous info
-        for widget in self.return_info_frame.winfo_children():
-            widget.destroy()
-        
         try:
-            # Fetch book by book_id field
-            book_query = self.db.collection('books').where(
+            # First try to search in lending records (most reliable)
+            lending_ref = self.db.collection('lendings')
+            query = lending_ref.where(
+                filter=firestore.FieldFilter('book_id', '==', book_id)
+            ).where(
+                filter=firestore.FieldFilter('status', '==', 'lent')
+            ).limit(1)
+            
+            lending_results = list(query.get())
+            
+            if lending_results:
+                lending_doc = lending_results[0]
+                lending_data = lending_doc.to_dict()
+                
+                # Get the book details using book_id
+                book_query = self.db.collection('books').where(
+                    filter=firestore.FieldFilter('book_id', '==', book_id)
+                ).limit(1)
+                
+                book_results = list(book_query.get())
+                
+                if book_results:
+                    book_doc = book_results[0]
+                    book_data = book_doc.to_dict()
+                    book_data['id'] = book_doc.id
+                    book_data['lending_id'] = lending_doc.id
+                    book_data['student_id'] = lending_data.get('student_id')
+                    book_data['lent_to'] = lending_data.get('student_name', 'Unknown')
+                    book_data['lent_date'] = lending_data.get('lent_date')
+                    book_data['due_date'] = lending_data.get('due_date')
+                    self.display_return_book_info(book_data)
+                    return
+                else:
+                    # If book not found by book_id, try direct document ID
+                    book_ref = self.db.collection('books').document(lending_data.get('book_id'))
+                    book_doc = book_ref.get()
+                    
+                    if book_doc.exists:
+                        book_data = book_doc.to_dict()
+                        book_data['id'] = book_doc.id
+                        book_data['lending_id'] = lending_doc.id
+                        book_data['student_id'] = lending_data.get('student_id')
+                        book_data['lent_to'] = lending_data.get('student_name', 'Unknown')
+                        book_data['lent_date'] = lending_data.get('lent_date')
+                        book_data['due_date'] = lending_data.get('due_date')
+                        self.display_return_book_info(book_data)
+                        return
+            
+            # Try to get the book directly by document ID
+            book_ref = self.db.collection('books').document(book_id)
+            book_doc = book_ref.get()
+            
+            # If direct match found
+            if book_doc.exists:
+                book_data = book_doc.to_dict()
+                book_data['id'] = book_doc.id
+                
+                # Check if the book is actually lent out
+                if book_data.get('status') == 'lent':
+                    # Get student data
+                    student_id = book_data.get('lent_to')
+                    
+                    # Look for the lending record
+                    lending_query = self.db.collection('lendings').where(
+                        filter=firestore.FieldFilter('book_id', '==', book_id)
+                    ).where(
+                        filter=firestore.FieldFilter('status', '==', 'lent')
+                    ).limit(1)
+                    
+                    lending_results = list(lending_query.get())
+                    if lending_results:
+                        lending_doc = lending_results[0]
+                        book_data['lending_id'] = lending_doc.id
+                    
+                    if student_id:
+                        student_ref = self.db.collection('students').document(student_id)
+                        student_doc = student_ref.get()
+                        if student_doc.exists:
+                            student_data = student_doc.to_dict()
+                            book_data['lent_to'] = student_data.get('name', 'Unknown')
+                            book_data['student_id'] = student_id
+                        
+                    self.display_return_book_info(book_data)
+                    return
+                else:
+                    messagebox.showerror("Book Not Lent", f"Book '{book_data.get('title', 'Unknown')}' is not currently lent out.")
+                    return
+            
+            # Check by book_id field in the books collection
+            books_query = self.db.collection('books').where(
                 filter=firestore.FieldFilter('book_id', '==', book_id)
             ).limit(1)
-            books = book_query.get()
             
-            if not books or len(books) == 0:
-                error_label = ttk.Label(self.return_info_frame, text=f"No book found with ID {book_id}.", foreground="red")
-                error_label.pack(anchor=tk.W, pady=5)
-                self.return_book_data = None
-                self.process_return_btn.config(state=tk.DISABLED)
-                return
+            books_results = list(books_query.get())
             
-            # Get book data
-            book_doc = books[0]
-            self.return_book_data = book_doc.to_dict()
-            self.return_book_data['id'] = book_doc.id  # Store document ID for reference
-            self.return_book_data['book_id'] = book_id  # Ensure book_id is saved
-            
-            # Check if actually lent
-            if self.return_book_data.get('status') != 'lent':
-                error_label = ttk.Label(self.return_info_frame, 
-                                     text=f"This book is not currently lent out. Current status: {self.return_book_data.get('status', 'unknown')}", 
-                                     foreground="red")
-                error_label.pack(anchor=tk.W, pady=5)
-                self.return_book_data = None
-                self.process_return_btn.config(state=tk.DISABLED)
-                return
-            
-            # Get student info
-            student_id = self.return_book_data.get('lent_to')
-            student_ref = self.db.collection('students').document(student_id)
-            student = student_ref.get()
-            
-            if student.exists:
-                student_data = student.to_dict()
-                student_name = student_data.get('name', 'Unknown')
-            else:
-                student_name = "Unknown"
-            
-            # Display book info
-            info_text = f"Title: {self.return_book_data.get('title', 'Unknown')}\n"
-            info_text += f"Author: {self.return_book_data.get('author', 'Unknown')}\n"
-            info_text += f"Lent to: {student_name}\n"
-            info_text += f"Lent date: {self.return_book_data.get('lent_date', 'Unknown')}\n"
-            info_text += f"Due date: {self.return_book_data.get('due_date', 'Unknown')}"
-            
-            info_label = ttk.Label(self.return_info_frame, text=info_text)
-            info_label.pack(anchor=tk.W, pady=5)
-            
-            # Check if overdue
-            try:
-                due_date = datetime.datetime.strptime(self.return_book_data.get('due_date', ''), "%Y-%m-%d")
-                today = datetime.datetime.now()
+            if books_results:
+                book_doc = books_results[0]
+                book_data = book_doc.to_dict()
+                book_data['id'] = book_doc.id
                 
-                if today > due_date:
-                    days_late = (today - due_date).days
-                    late_label = ttk.Label(self.return_info_frame, 
-                                        text=f"OVERDUE by {days_late} days!", 
-                                        foreground="red", font=('Arial', 12, 'bold'))
-                    late_label.pack(anchor=tk.W, pady=5)
-            except Exception as e:
-                print(f"Error checking due date: {e}")
+                # Check if the book is actually lent out
+                if book_data.get('status') == 'lent':
+                    # Get student data
+                    student_id = book_data.get('lent_to')
+                    
+                    # Look for the lending record
+                    lending_query = self.db.collection('lendings').where(
+                        filter=firestore.FieldFilter('book_id', '==', book_id)
+                    ).where(
+                        filter=firestore.FieldFilter('status', '==', 'lent')
+                    ).limit(1)
+                    
+                    lending_results = list(lending_query.get())
+                    if lending_results:
+                        lending_doc = lending_results[0]
+                        book_data['lending_id'] = lending_doc.id
+                    
+                    if student_id:
+                        student_ref = self.db.collection('students').document(student_id)
+                        student_doc = student_ref.get()
+                        if student_doc.exists:
+                            student_data = student_doc.to_dict()
+                            book_data['lent_to'] = student_data.get('name', 'Unknown')
+                            book_data['student_id'] = student_id
+                        
+                    self.display_return_book_info(book_data)
+                    return
+            else:
+                    messagebox.showerror("Book Not Lent", f"Book '{book_data.get('title', 'Unknown')}' is not currently lent out.")
+                    return
+                
+            # Check for library_records as a fallback
+            records_ref = self.db.collection('library_records')
+            query = records_ref.where(
+                filter=firestore.FieldFilter('book_id', '==', book_id)
+            ).where(
+                filter=firestore.FieldFilter('status', '==', 'lent')
+            ).limit(1)
             
-            # Enable return button
-            self.process_return_btn.config(state=tk.NORMAL)
+            record_results = list(query.get())
+            
+            if record_results:
+                record_doc = record_results[0]
+                record_data = record_doc.to_dict()
+                
+                # Get the book details
+                book_id_from_record = record_data.get('book_id')
+                
+                # Try to find the book
+                book_query = self.db.collection('books').where(
+                    filter=firestore.FieldFilter('book_id', '==', book_id_from_record)
+                ).limit(1)
+                
+                book_results = list(book_query.get())
+                book_data = None
+                
+                if book_results:
+                    book_doc = book_results[0]
+                    book_data = book_doc.to_dict()
+                    book_data['id'] = book_doc.id
+                else:
+                    # Try by document ID
+                    book_ref = self.db.collection('books').document(book_id_from_record)
+                    book_doc = book_ref.get()
+                    
+                    if book_doc.exists:
+                        book_data = book_doc.to_dict()
+                        book_data['id'] = book_doc.id
+                
+                if book_data:
+                    book_data['library_record_id'] = record_doc.id
+                    book_data['student_id'] = record_data.get('student_id')
+                    book_data['lent_to'] = record_data.get('student_name', 'Unknown')
+                    book_data['lent_date'] = record_data.get('lent_date')
+                    book_data['due_date'] = record_data.get('due_date')
+                    self.display_return_book_info(book_data)
+                    return
+            
+            # No book found
+            messagebox.showerror("Book Not Found", f"No book with ID '{book_id}' is currently checked out.")
             
         except Exception as e:
-            error_label = ttk.Label(self.return_info_frame, text=f"Error fetching book: {e}", foreground="red")
-            error_label.pack(anchor=tk.W, pady=5)
-            self.return_book_data = None
-            self.process_return_btn.config(state=tk.DISABLED)
+            print(f"Error finding book: {e}")
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"An error occurred: {str(e)}")
     
     def process_return(self):
-        """Process book return"""
+        """Process the book return"""
         if not self.return_book_data:
+            messagebox.showerror("Error", "Please select a book to return first.")
             return
         
         try:
-            # Update book status using document ID
-            book_ref = self.db.collection('books').document(self.return_book_data['id'])
+            book_id = self.return_book_data['id']  # This is the document ID
+            book_id_field = self.return_book_data.get('book_id', book_id)  # Use the book_id field if available
+            
+            # Update book status to available
+            book_ref = self.db.collection('books').document(book_id)
+            book_doc = book_ref.get()
+            
+            if not book_doc.exists:
+                messagebox.showerror("Error", "Book not found in database.")
+                return
+            
+            # Update book status to available
             book_ref.update({
                 'status': 'available',
                 'lent_to': None,
                 'lent_date': None,
                 'due_date': None,
-                'available': True  # Set available to True when returning
+                'available': True,
+                'last_updated': datetime.datetime.now()
             })
             
-            # Find the lending record
-            records_ref = self.db.collection('library_records')
-            query = records_ref.where(
-                filter=firestore.FieldFilter('book_id', '==', self.return_book_data.get('book_id'))
+            now = datetime.datetime.now()
+            return_date = now.strftime("%Y-%m-%d")
+            student_id = self.return_book_data.get('student_id')
+            student_name = self.return_book_data.get('lent_to', 'Unknown')
+            book_title = self.return_book_data.get('title', 'Unknown Book')
+            
+            # Update lending record if we have a lending_id
+            lending_record_id = None
+            if 'lending_id' in self.return_book_data:
+                lending_ref = self.db.collection('lendings').document(self.return_book_data['lending_id'])
+                lending_ref.update({
+                    'status': 'returned',
+                    'return_date': return_date,
+                    'return_timestamp': now
+                })
+                lending_record_id = self.return_book_data['lending_id']
+            else:
+                # Try to find the lending record
+                lending_query = self.db.collection('lendings').where(
+                    filter=firestore.FieldFilter('book_id', '==', book_id_field)
             ).where(
                 filter=firestore.FieldFilter('status', '==', 'lent')
-            )
-            
-            results = query.get()
-            
-            # Get current time with hour, minute, second
-            now = datetime.datetime.now()
-            return_date_time = now.strftime("%Y-%m-%d %H:%M:%S")
-            
-            # Update status of original lending record but keep it for history
-            for doc in results:
-                lent_record = doc.to_dict()
-                doc.reference.update({
+                ).limit(1)
+                
+                lending_results = list(lending_query.get())
+                
+                if lending_results:
+                    lending_doc = lending_results[0]
+                    lending_data = lending_doc.to_dict()
+                    student_id = lending_data.get('student_id', student_id)
+                    student_name = lending_data.get('student_name', student_name)
+                    lending_record_id = lending_doc.id
+                    
+                    # Update lending record
+                    lending_doc.reference.update({
                     'status': 'returned',
-                    'return_date': return_date_time,
+                        'return_date': return_date,
                     'return_timestamp': now
                 })
                 
-                # Create a new separate record for the return action
-                return_record = {
-                    'book_id': self.return_book_data.get('book_id'),
-                    'book_title': self.return_book_data.get('title', 'Unknown'),
-                    'student_id': lent_record.get('student_id'),
-                    'student_name': lent_record.get('student_name', 'Unknown'),
-                    'student_rfid': lent_record.get('student_rfid', 'Unknown'),
-                    'original_lent_date': lent_record.get('lent_date'),
-                    'return_date': return_date_time,
-                    'status': 'return_record',  # New status to identify return records
-                    'timestamp': now,
-                    'action_type': 'return'  # Explicitly mark the action type
-                }
+            # Update library_records if we have a library_record_id - DO NOT DELETE LENDING RECORD
+            library_record_updated = False
+            if 'library_record_id' in self.return_book_data:
+                record_ref = self.db.collection('library_records').document(self.return_book_data['library_record_id'])
+                record_ref.update({
+                    'status': 'returned',
+                    'return_date': return_date,
+                    'return_timestamp': now
+                })
+                library_record_updated = True
+            else:
+                # Try to find library_records record
+                records_query = self.db.collection('library_records').where(
+                    filter=firestore.FieldFilter('book_id', '==', book_id_field)
+                ).where(
+                    filter=firestore.FieldFilter('status', '==', 'lent')
+                )
                 
-                # Add the return record as a separate document
-                self.db.collection('library_records').add(return_record)
+                records_results = list(records_query.get())
+                
+                for record_doc in records_results:
+                    # Update each matching record (in case there are duplicates)
+                    record_doc.reference.update({
+                        'status': 'returned',
+                        'return_date': return_date,
+                        'return_timestamp': now
+                    })
+                    library_record_updated = True
             
-            # Show success message
-            messagebox.showinfo("Success", f"Book '{self.return_book_data.get('title')}' successfully returned.")
+            # Create a single return record in the returns collection
+            return_data = {
+                'book_id': book_id_field,  # Use the book_id field instead of document ID
+                'book_title': book_title,
+                'student_id': student_id,
+                'student_name': student_name,
+                'return_date': return_date,
+                'return_timestamp': now,
+                'status': 'return_record',  # Mark this as a return record
+                'lending_record_id': lending_record_id,  # Link to the original lending record
+                'activity_type': 'book_return'  # For activity tracking
+            }
             
-            # Return to library menu
-            self.show_library_menu()
+            # Add to returns collection
+            returns_ref = self.db.collection('returns')
+            return_doc = returns_ref.add(return_data)
+            
+            # Only add to library_records if no existing record was updated
+            # This prevents duplicate return records
+            if not library_record_updated:
+                self.db.collection('library_records').add(return_data)
+            
+            # Get book recommendations based on lending history
+            similar_books = get_similar_books(self.db, book_id_field)  # Use book_id_field for recommendations
+            user_recommendations = []
+            
+            if student_id:
+                user_recommendations = get_book_recommendations(self.db, student_id)
+            
+            # Store the return book data before clearing it
+            return_book_data_copy = self.return_book_data
+            
+            # Clear the return data
+            self.return_book_data = None
+            
+            # Set flag for recommendation window
+            self.recommendation_window_shown = False
+            
+            # Show a combined success and recommendations window
+            # This will block until the window is closed
+            self.show_return_success_with_recommendations(
+                book_title,
+                similar_books,
+                user_recommendations
+            )
+            
+            # Now that the recommendations window is closed, refresh the return UI
+            self.show_return_ui()
             
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to process return: {e}")
+            print(f"Error processing return: {e}")
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"An error occurred while processing the return: {str(e)}")
+    
+    def show_return_success_with_recommendations(self, book_title, similar_books, user_recommendations):
+        """Show combined success message and book recommendations in one window"""
+        try:
+            # Create a new toplevel window
+            rec_window = tk.Toplevel(self.root)
+            rec_window.title("Book Returned Successfully")
+            rec_window.geometry("550x500")
+            rec_window.transient(self.root)  # Set as transient to main window
+            rec_window.grab_set()  # Make window modal
+            
+            # Create main frame with padding
+            main_frame = ttk.Frame(rec_window, padding=20)
+            main_frame.pack(fill=tk.BOTH, expand=True)
+            
+            # Add success message
+            success_frame = ttk.Frame(main_frame)
+            success_frame.pack(fill=tk.X, pady=(0, 15))
+            
+            # Add success icon (checkmark)
+            success_label = ttk.Label(success_frame, text="✓", font=('Arial', 24, 'bold'), foreground="green")
+            success_label.pack(side=tk.LEFT, padx=(0, 10))
+            
+            # Success message
+            message_frame = ttk.Frame(success_frame)
+            message_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            
+            title_label = ttk.Label(message_frame, text=f"'{book_title}' has been returned successfully!", 
+                                  font=('Arial', 12, 'bold'), wraplength=400)
+            title_label.pack(anchor=tk.W)
+            
+            ttk.Separator(main_frame, orient='horizontal').pack(fill=tk.X, pady=10)
+            
+            # Recommendations title
+            rec_title = ttk.Label(main_frame, text="Book Recommendations", font=('Arial', 12, 'bold'))
+            rec_title.pack(pady=(0, 10))
+            
+            # Create a frame for recommendations with scrolling capability
+            canvas = tk.Canvas(main_frame)
+            scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+            scrollable_frame = ttk.Frame(canvas)
+            
+            scrollable_frame.bind(
+                "<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+            )
+            
+            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            
+            # Flag to track if we displayed any recommendations
+            displayed_recommendations = False
+            
+            # Add similar books section if available
+            if similar_books:
+                similar_label = ttk.Label(scrollable_frame, text="Users who read this book also read:", 
+                                       font=('Arial', 11, 'bold'))
+                similar_label.pack(anchor=tk.W, pady=(0, 5))
+                
+                similar_frame = ttk.Frame(scrollable_frame)
+                similar_frame.pack(fill=tk.X, pady=(0, 15))
+                
+                for i, book in enumerate(similar_books):
+                    book_frame = ttk.Frame(similar_frame)
+                    book_frame.pack(fill=tk.X, pady=5)
+                    
+                    book_title = book.get('title', 'Unknown')
+                    book_author = book.get('author', 'Unknown')
+                    book_category = book.get('category', 'Unknown category')
+                    
+                    ttk.Label(book_frame, text=f"{i+1}.", width=2).pack(side=tk.LEFT)
+                    ttk.Label(book_frame, text=f"{book_title}", 
+                            font=('Arial', 10, 'bold'),
+                            wraplength=400).pack(side=tk.LEFT, fill=tk.X, expand=True, anchor=tk.W)
+                    
+                    details_frame = ttk.Frame(similar_frame)
+                    details_frame.pack(fill=tk.X, padx=(15, 0), pady=(0, 5))
+                    ttk.Label(details_frame, text=f"Author: {book_author}", 
+                            font=('Arial', 9)).pack(anchor=tk.W)
+                    ttk.Label(details_frame, text=f"Category: {book_category}", 
+                            font=('Arial', 9)).pack(anchor=tk.W)
+                
+                displayed_recommendations = True
+            
+            # Add user recommendations section if available
+            if user_recommendations:
+                user_label = ttk.Label(scrollable_frame, text="Based on your reading history:", 
+                                     font=('Arial', 11, 'bold'))
+                user_label.pack(anchor=tk.W, pady=(10, 5))
+                
+                user_frame = ttk.Frame(scrollable_frame)
+                user_frame.pack(fill=tk.X, pady=(0, 15))
+                
+                for i, book in enumerate(user_recommendations):
+                    book_frame = ttk.Frame(user_frame)
+                    book_frame.pack(fill=tk.X, pady=5)
+                    
+                    book_title = book.get('title', 'Unknown')
+                    book_author = book.get('author', 'Unknown')
+                    book_category = book.get('category', 'Unknown category')
+                    
+                    ttk.Label(book_frame, text=f"{i+1}.", width=2).pack(side=tk.LEFT)
+                    ttk.Label(book_frame, text=f"{book_title}", 
+                            font=('Arial', 10, 'bold'),
+                            wraplength=400).pack(side=tk.LEFT, fill=tk.X, expand=True, anchor=tk.W)
+                    
+                    details_frame = ttk.Frame(user_frame)
+                    details_frame.pack(fill=tk.X, padx=(15, 0), pady=(0, 5))
+                    ttk.Label(details_frame, text=f"Author: {book_author}", 
+                            font=('Arial', 9)).pack(anchor=tk.W)
+                    ttk.Label(details_frame, text=f"Category: {book_category}", 
+                            font=('Arial', 9)).pack(anchor=tk.W)
+                
+                displayed_recommendations = True
+            
+            # If no recommendations were displayed, show a message
+            if not displayed_recommendations:
+                no_rec_label = ttk.Label(scrollable_frame, 
+                                       text="No recommendations available for this book.\nWe'll recommend books from similar categories.", 
+                                       font=('Arial', 11), foreground="#555555")
+                no_rec_label.pack(pady=20)
+                
+                # Try to get random books from any category
+                try:
+                    books_ref = self.db.collection('books').where(
+                        filter=firestore.FieldFilter('available', '==', True)
+                    ).limit(3)
+                    
+                    random_books = list(books_ref.get())
+                    if random_books:
+                        random_label = ttk.Label(scrollable_frame, text="You might also like:", 
+                                              font=('Arial', 11, 'bold'))
+                        random_label.pack(anchor=tk.W, pady=(10, 5))
+                        
+                        random_frame = ttk.Frame(scrollable_frame)
+                        random_frame.pack(fill=tk.X, pady=(0, 15))
+                        
+                        for i, doc in enumerate(random_books):
+                            book = doc.to_dict()
+                            book_frame = ttk.Frame(random_frame)
+                            book_frame.pack(fill=tk.X, pady=5)
+                            
+                            book_title = book.get('title', 'Unknown')
+                            book_author = book.get('author', 'Unknown')
+                            book_category = book.get('category', 'Unknown category')
+                            
+                            ttk.Label(book_frame, text=f"{i+1}.", width=2).pack(side=tk.LEFT)
+                            ttk.Label(book_frame, text=f"{book_title}", 
+                                    font=('Arial', 10, 'bold'),
+                                    wraplength=400).pack(side=tk.LEFT, fill=tk.X, expand=True, anchor=tk.W)
+                            
+                            details_frame = ttk.Frame(random_frame)
+                            details_frame.pack(fill=tk.X, padx=(15, 0), pady=(0, 5))
+                            ttk.Label(details_frame, text=f"Author: {book_author}", 
+                                    font=('Arial', 9)).pack(anchor=tk.W)
+                            ttk.Label(details_frame, text=f"Category: {book_category}", 
+                                    font=('Arial', 9)).pack(anchor=tk.W)
+                except Exception as e:
+                    print(f"Error fetching random books: {e}")
+            
+            # Pack the scrollable components
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+            
+            # Close button
+            ttk.Button(rec_window, text="Close", command=rec_window.destroy).pack(pady=(0, 10))
+            
+            # Make sure window appears on top and gets focus
+            rec_window.lift()
+            rec_window.focus_force()
+            
+            # Flag to indicate the window has been shown
+            self.recommendation_window_shown = True
+            
+            # Wait for the window to be closed before proceeding
+            self.root.wait_window(rec_window)
+            
+        except Exception as e:
+            print(f"Error showing success with recommendations: {e}")
+            import traceback
+            traceback.print_exc()
+            messagebox.showinfo("Success", f"Book '{book_title}' has been returned successfully.")
     
     def show_check_books_ui(self):
         """Show interface to check books lent to a student"""
@@ -1304,10 +1680,10 @@ class LibraryUI:
             if not book_data.get('available', True) and book_data.get('lent_to'):
                 student_id = book_data.get('lent_to')
                 student_ref = self.db.collection('students').document(student_id)
-                student = student_ref.get()
+                student_doc = student_ref.get()
                 
-                if student.exists:
-                    student_data = student.to_dict()
+                if student_doc.exists:
+                    student_data = student_doc.to_dict()
                     details += f"Borrowed by: {student_data.get('name', 'Unknown')}\n"
                     details += f"Lent on: {book_data.get('lent_date', 'Unknown')}\n"
                     details += f"Due on: {book_data.get('due_date', 'Unknown')}\n"
@@ -1417,3 +1793,67 @@ class LibraryUI:
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to generate catalog: {e}") 
+    
+    def display_return_book_info(self, book_data):
+        """Display information about a book selected for return"""
+        # Clear previous info
+        for widget in self.return_info_frame.winfo_children():
+            widget.destroy()
+        
+        # Store book data for the return process
+        self.return_book_data = book_data
+        
+        # Display book info
+        title_label = ttk.Label(self.return_info_frame, text=f"Title: {book_data.get('title', 'Unknown')}", font=('Arial', 12))
+        title_label.pack(anchor=tk.W, pady=(0, 5))
+        
+        author_label = ttk.Label(self.return_info_frame, text=f"Author: {book_data.get('author', 'Unknown')}")
+        author_label.pack(anchor=tk.W, pady=2)
+        
+        # Book ID & status
+        book_id_label = ttk.Label(self.return_info_frame, text=f"Book ID: {book_data.get('book_id', book_data.get('id', 'Unknown'))}")
+        book_id_label.pack(anchor=tk.W, pady=2)
+        
+        status_label = ttk.Label(self.return_info_frame, text=f"Status: {book_data.get('status', 'Unknown')}")
+        status_label.pack(anchor=tk.W, pady=2)
+        
+        # Student info
+        lent_to_label = ttk.Label(self.return_info_frame, text=f"Lent to: {book_data.get('lent_to', 'Unknown')}")
+        lent_to_label.pack(anchor=tk.W, pady=2)
+        
+        lent_date_label = ttk.Label(self.return_info_frame, text=f"Lent date: {book_data.get('lent_date', 'Unknown')}")
+        lent_date_label.pack(anchor=tk.W, pady=2)
+        
+        due_date_label = ttk.Label(self.return_info_frame, text=f"Due date: {book_data.get('due_date', 'Unknown')}")
+        due_date_label.pack(anchor=tk.W, pady=2)
+        
+        # Store record IDs but don't display them
+        if 'lending_id' in book_data:
+            # We keep the ID in return_book_data but don't display it
+            pass
+        
+        if 'library_record_id' in book_data:
+            # We keep the ID in return_book_data but don't display it
+            pass
+        
+        # Check if overdue
+        due_date = book_data.get('due_date')
+        if due_date:
+            try:
+                if isinstance(due_date, str):
+                    due_date_obj = datetime.datetime.strptime(due_date, "%Y-%m-%d")
+                else:
+                    due_date_obj = due_date
+                    
+                today = datetime.datetime.now()
+                if today > due_date_obj:
+                    days_late = (today - due_date_obj).days
+                    overdue_label = ttk.Label(self.return_info_frame, 
+                                         text=f"OVERDUE by {days_late} days!", 
+                                         foreground="red", font=('Arial', 12, 'bold'))
+                    overdue_label.pack(anchor=tk.W, pady=5)
+            except Exception as e:
+                print(f"Error checking due date: {e}")
+        
+        # Enable return button
+        self.process_return_btn.config(state=tk.NORMAL)

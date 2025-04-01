@@ -7,7 +7,7 @@ from firebase_admin import firestore
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils import validate_rfid, read_rfid_input, get_student_by_rfid, format_currency
+from utils import validate_rfid, read_rfid_input, get_student_by_rfid, format_currency, get_spending_pattern, recommend_recharge_amount
 
 class CanteenUI:
     def __init__(self, root, db, go_back_callback=None):
@@ -387,36 +387,35 @@ class CanteenUI:
     
     def process_recharge(self, student):
         try:
-            amount_str = self.recharge_amount_entry.get().strip()
-            method = self.recharge_method_var.get()
-            
-            # Validate input
-            if not amount_str:
-                messagebox.showerror("Invalid Input", "Please enter a valid amount.")
-                return
-                
+            amount = self.recharge_amount_entry.get().strip()
             try:
-                amount = float(amount_str)
+                amount = float(amount)
                 if amount <= 0:
-                    messagebox.showerror("Invalid Amount", "Amount must be greater than zero.")
+                    messagebox.showerror("Invalid Amount", "Please enter a positive amount.")
                     return
             except ValueError:
-                messagebox.showerror("Invalid Amount", "Please enter a valid number for amount.")
+                messagebox.showerror("Invalid Amount", "Please enter a valid number.")
                 return
                 
+            # Get student reference
+            student_ref = self.db.collection('students').document(student['id'])
+            
+            # Get current balance
+            current_balance = student.get('wallet_balance', 0)
+            new_balance = current_balance + amount
+            
             # Process the transaction
             transaction = {
                 'student_id': student['id'],
-                'amount': amount,
+                'student_name': student.get('name', 'Unknown'),
+                'student_rfid': student.get('rfid', 'Unknown'),
                 'type': 'credit',
-                'description': f"Wallet Recharge via {method}",
+                'amount': amount,
+                'description': f"Wallet Recharge",
                 'location': 'Canteen',
-                'timestamp': datetime.datetime.now()
+                'timestamp': datetime.datetime.now(),
+                'balance_after': new_balance
             }
-            
-            # Update student's wallet balance
-            current_balance = student.get('wallet_balance', 0)
-            new_balance = current_balance + amount
             
             # Perform the database operations in a transaction
             transaction_batch = self.db.batch()
@@ -426,24 +425,18 @@ class CanteenUI:
             transaction_batch.set(transaction_ref, transaction)
             
             # Update student balance
-            student_ref = self.db.collection('students').document(student['id'])
             transaction_batch.update(student_ref, {'wallet_balance': new_balance})
             
-            # Commit the batch
+            # Commit the transaction
             transaction_batch.commit()
             
-            # Show success message
             messagebox.showinfo("Recharge Successful", 
-                              f"Wallet recharged with {format_currency(amount)} successfully.\nNew Balance: {format_currency(new_balance)}")
-                              
-            # Clear entry
-            self.recharge_amount_entry.delete(0, tk.END)
+                              f"Wallet recharged with {format_currency(amount)}.\nNew balance: {format_currency(new_balance)}")
             
             # Refresh the student info and transactions display
             self.process_rfid_for_recharge()
-            
         except Exception as e:
-            messagebox.showerror("Error", f"An error occurred while processing recharge: {str(e)}")
+            messagebox.showerror("Error", f"Failed to process recharge: {e}")
     
     def show_balance_screen(self):
         # Clear the main frame
@@ -484,8 +477,6 @@ class CanteenUI:
     
     def check_balance(self):
         # Clear previous content in frames
-        for widget in self.balance_student_info_frame.winfo_children():
-            widget.destroy()
         for widget in self.balance_details_frame.winfo_children():
             widget.destroy()
             
@@ -503,23 +494,118 @@ class CanteenUI:
             return
             
         # Display student info
-        ttk.Label(self.balance_student_info_frame, text=f"Student: {student.get('name', 'N/A')}", 
+        ttk.Label(self.balance_details_frame, text=f"Student: {student.get('name', 'N/A')}", 
                  font=("Helvetica", 12)).pack(anchor=tk.W, padx=5)
-        ttk.Label(self.balance_student_info_frame, text=f"Department: {student.get('department', 'N/A')} - {student.get('year', 'N/A')} Year", 
+        ttk.Label(self.balance_details_frame, text=f"Department: {student.get('department', 'N/A')} - {student.get('year', 'N/A')} Year", 
                  font=("Helvetica", 10)).pack(anchor=tk.W, padx=5)
         
-        # Display balance
-        balance_frame = ttk.Frame(self.balance_details_frame)
-        balance_frame.pack(fill=tk.X, pady=10)
+        # Display current balance with appropriate color
+        current_balance = student.get('wallet_balance', 0)
+        balance_color = "green" if current_balance > 200 else ("orange" if current_balance > 50 else "red")
         
-        ttk.Label(balance_frame, text="Current Balance:", 
-                 font=("Helvetica", 14)).pack(side=tk.LEFT, padx=5)
-        ttk.Label(balance_frame, text=format_currency(student.get('wallet_balance', 0)), 
-                 font=("Helvetica", 14, "bold")).pack(side=tk.LEFT, padx=5)
+        balance_frame = ttk.Frame(self.balance_details_frame)
+        balance_frame.pack(anchor=tk.W, padx=5, pady=5, fill=tk.X)
+        
+        ttk.Label(balance_frame, text="Current Balance: ", 
+                 font=("Helvetica", 12, "bold")).pack(side=tk.LEFT)
+        ttk.Label(balance_frame, text=f"{format_currency(current_balance)}", 
+                 font=("Helvetica", 12, "bold"), foreground=balance_color).pack(side=tk.LEFT)
+        
+        # If balance is low, check spending pattern and suggest recharge amount
+        if current_balance < 100:
+            try:
+                # Get spending pattern and suggested amount
+                spending_pattern = get_spending_pattern(self.db, student['id'])
+                suggested_amount = recommend_recharge_amount(spending_pattern)
+                
+                # Create suggestion frame
+                suggestion_frame = ttk.Frame(self.balance_details_frame)
+                suggestion_frame.pack(anchor=tk.W, padx=5, pady=10, fill=tk.X)
+                
+                # Display low balance warning
+                ttk.Label(suggestion_frame, 
+                         text=f"Your balance is running low. Based on your spending pattern,", 
+                         foreground="#D35400").pack(anchor=tk.W)
+                ttk.Label(suggestion_frame, 
+                         text=f"we suggest recharging with {format_currency(suggested_amount)}.", 
+                         foreground="#D35400", font=("Helvetica", 10, "bold")).pack(anchor=tk.W)
+                
+                # If we have spending pattern data, show it
+                if spending_pattern:
+                    ttk.Label(suggestion_frame, 
+                            text=f"Average daily spend: {format_currency(spending_pattern['daily_avg'])} | Weekly: {format_currency(spending_pattern['weekly_avg'])}", 
+                            foreground="#555555", font=("Helvetica", 9)).pack(anchor=tk.W, pady=(5,0))
+                
+                # Add a quick recharge button with the suggested amount
+                ttk.Button(suggestion_frame, text=f"Recharge {format_currency(suggested_amount)}", 
+                          command=lambda: self.quick_recharge(student, suggested_amount)).pack(anchor=tk.W, pady=10)
+            except Exception as e:
+                # In case of any error, provide a default recommendation
+                print(f"Error getting spending pattern: {e}")
+                
+                suggestion_frame = ttk.Frame(self.balance_details_frame)
+                suggestion_frame.pack(anchor=tk.W, padx=5, pady=10, fill=tk.X)
+                
+                default_amount = 500  # Default recommendation
+                
+                ttk.Label(suggestion_frame, 
+                         text=f"Your balance is running low.", 
+                         foreground="#D35400").pack(anchor=tk.W)
+                ttk.Label(suggestion_frame, 
+                         text=f"We recommend recharging with {format_currency(default_amount)}.", 
+                         foreground="#D35400", font=("Helvetica", 10, "bold")).pack(anchor=tk.W)
+                
+                # Add a quick recharge button with the default amount
+                ttk.Button(suggestion_frame, text=f"Recharge {format_currency(default_amount)}", 
+                          command=lambda: self.quick_recharge(student, default_amount)).pack(anchor=tk.W, pady=10)
         
         # Transaction history
         ttk.Label(self.balance_details_frame, text="Recent Transactions:", 
                  font=("Helvetica", 11)).pack(anchor=tk.W, padx=5, pady=(15,5))
         
         # Display recent transactions
-        self.display_recent_transactions(self.balance_details_frame, student['id']) 
+        self.display_recent_transactions(self.balance_details_frame, student['id'])
+
+    def quick_recharge(self, student, amount):
+        """Process a quick recharge with suggested amount"""
+        try:
+            # Get student reference
+            student_ref = self.db.collection('students').document(student['id'])
+            
+            # Get current balance
+            current_balance = student.get('wallet_balance', 0)
+            new_balance = current_balance + amount
+            
+            # Process the transaction
+            transaction = {
+                'student_id': student['id'],
+                'student_name': student.get('name', 'Unknown'),
+                'student_rfid': student.get('rfid', 'Unknown'),
+                'type': 'credit',
+                'amount': amount,
+                'description': f"Quick Wallet Recharge",
+                'location': 'Canteen',
+                'timestamp': datetime.datetime.now(),
+                'balance_after': new_balance
+            }
+            
+            # Perform the database operations in a transaction
+            transaction_batch = self.db.batch()
+            
+            # Add transaction
+            transaction_ref = self.db.collection('transactions').document()
+            transaction_batch.set(transaction_ref, transaction)
+            
+            # Update student balance
+            transaction_batch.update(student_ref, {'wallet_balance': new_balance})
+            
+            # Commit the transaction
+            transaction_batch.commit()
+            
+            messagebox.showinfo("Recharge Successful", 
+                               f"Wallet recharged with {format_currency(amount)}.\nNew balance: {format_currency(new_balance)}")
+            
+            # Refresh the student info and transactions display
+            self.check_balance()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to process quick recharge: {e}") 

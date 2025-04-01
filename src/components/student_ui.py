@@ -91,8 +91,58 @@ class StudentUI:
         for widget in self.main_frame.winfo_children():
             widget.destroy()
             
+        # Create a parent frame for both the scrollable area and the back button
+        parent_frame = ttk.Frame(self.main_frame)
+        parent_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Create a separate frame for the back button at the bottom
+        button_frame = ttk.Frame(self.main_frame)
+        button_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+        
+        # Add the back button to the bottom frame (this will always be visible)
+        back_btn = ttk.Button(button_frame, text="Back", command=self.show_student_menu)
+        back_btn.pack(pady=5)
+        
+        # Create a canvas with scrollbar for scrollable content
+        canvas = tk.Canvas(parent_frame)
+        scrollbar = ttk.Scrollbar(parent_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        
+        # Configure the canvas
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        # Bind mouse wheel events for scrolling - with proper cleanup
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        def _bind_mouse_wheel():
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        def _unbind_mouse_wheel():
+            canvas.unbind_all("<MouseWheel>")
+        
+        # Bind the mousewheel when entering the canvas, unbind when leaving
+        canvas.bind("<Enter>", lambda e: _bind_mouse_wheel())
+        canvas.bind("<Leave>", lambda e: _unbind_mouse_wheel())
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Set minimum sizes to ensure scrolling works properly
+        self.main_frame.update_idletasks()
+        width = self.main_frame.winfo_width()
+        height = self.main_frame.winfo_height() - 50  # Reserve space for back button
+        canvas.config(width=width-20, height=height)
+        
+        # Pack the scrollbar and canvas
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        
         # Create a frame for student information
-        info_frame = ttk.Frame(self.main_frame)
+        info_frame = ttk.Frame(scrollable_frame)
         info_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         # Create header with student info
@@ -166,19 +216,15 @@ class StudentUI:
         tree.column("details", width=350)
         
         # Add a scrollbar
-        scrollbar = ttk.Scrollbar(activity_frame, orient=tk.VERTICAL, command=tree.yview)
-        tree.configure(yscrollcommand=scrollbar.set)
+        tree_scrollbar = ttk.Scrollbar(activity_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=tree_scrollbar.set)
         
         # Pack the treeview and scrollbar
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         # Fetch and display recent activity
         self.load_recent_activity(tree, student['id'])
-        
-        # Back button
-        ttk.Button(self.main_frame, text="Back", 
-                  command=self.show_rfid_input).pack(pady=10)
     
     def display_attendance_info(self, parent_frame, student_id):
         try:
@@ -252,26 +298,45 @@ class StudentUI:
     
     def display_library_info(self, parent_frame, student_id):
         try:
-            # Get books currently borrowed
+            # Track books by their ID to avoid duplicates
+            books_by_id = {}
+            returned_books = set()
+            
+            # First, get all return records to know which books have been returned
             library_records_ref = self.db.collection('library_records')
-            query = library_records_ref.where(
+            returns_query = library_records_ref.where(
+                filter=firestore.FieldFilter('student_id', '==', student_id)
+            ).where(
+                filter=firestore.FieldFilter('status', 'in', ['returned', 'return_record'])
+            )
+            
+            for doc in returns_query.get():
+                data = doc.to_dict()
+                book_id = data.get('book_id')
+                if book_id:
+                    returned_books.add(book_id)
+            
+            # Now get all lending records
+            lending_query = library_records_ref.where(
                 filter=firestore.FieldFilter('student_id', '==', student_id)
             ).where(
                 filter=firestore.FieldFilter('status', '==', 'lent')
             )
             
-            results = query.get()
-            
-            # Count books
-            borrowed_books = []
-            
-            for doc in results:
+            for doc in lending_query.get():
                 data = doc.to_dict()
-                borrowed_books.append({
+                book_id = data.get('book_id')
+                
+                # Only add books that haven't been returned
+                if book_id and book_id not in returned_books:
+                    books_by_id[book_id] = {
                     'title': data.get('book_title', 'Unknown Book'),
                     'due_date': data.get('due_date'),
-                    'book_id': data.get('book_id', 'Unknown')
-                })
+                        'book_id': book_id
+                    }
+            
+            # Convert to list for display
+            borrowed_books = list(books_by_id.values())
             
             ttk.Label(parent_frame, text="Library:", font=("Helvetica", 12, "bold")).pack(anchor=tk.W, pady=(10, 5))
             
@@ -304,6 +369,8 @@ class StudentUI:
             
         except Exception as e:
             print(f"Error loading library info: {e}")
+            import traceback
+            traceback.print_exc()
             ttk.Label(parent_frame, text="Library: Error loading data", foreground="red").pack(anchor=tk.W, pady=2)
     
     def display_bus_info(self, parent_frame, student_id):
@@ -342,203 +409,152 @@ class StudentUI:
             ttk.Label(parent_frame, text="Transport: Error loading data", foreground="red").pack(anchor=tk.W, pady=2)
     
     def load_recent_activity(self, tree, student_id):
+        """Load recent activity for the student"""
         try:
             # Clear existing items
             for item in tree.get_children():
                 tree.delete(item)
                 
-            # Combine all activities
-            all_activities = []
+            # Recent activity: Transactions (wallet), Library, Bus, Attendance
+            activity_list = []
             
-            # Get transactions - without using order_by in Firestore
-            transactions_ref = self.db.collection('transactions')
-            txn_query = transactions_ref.where(filter=firestore.FieldFilter('student_id', '==', student_id))
-            transactions = list(txn_query.get())
+            # Track book returns to avoid duplicates
+            returned_books = {}  # book_id -> timestamp
             
-            for tx in transactions:
-                tx_data = tx.to_dict()
-                timestamp = tx_data.get('timestamp')
-                if not timestamp:
-                    continue
-                
-                date_str = timestamp.strftime("%Y-%m-%d %H:%M") if timestamp else "N/A"
-                
-                amount = format_currency(tx_data.get('amount', 0))
-                tx_type = tx_data.get('type', 'unknown')
-                description = tx_data.get('description', '')
-                
-                details = f"{amount} {'received' if tx_type == 'credit' else 'spent'}"
-                if description:
-                    details += f" - {description}"
-                
-                all_activities.append({
-                    'timestamp': timestamp,
-                    'date_str': date_str,
-                    'type': 'Wallet',
-                    'details': details
-                })
-            
-            # Get attendance - without using order_by in Firestore
-            attendance_ref = self.db.collection('attendance')
-            att_query = attendance_ref.where(filter=firestore.FieldFilter('student_id', '==', student_id))
-            attendance = list(att_query.get())
-            
-            for att in attendance:
-                att_data = att.to_dict()
-                timestamp = att_data.get('timestamp')
-                if not timestamp:
-                    continue
-                
-                date_str = timestamp.strftime("%Y-%m-%d %H:%M") if timestamp else "N/A"
-                
-                status = att_data.get('status', 'unknown')
-                course = att_data.get('classroom_key', 'Unknown')
-                department = att_data.get('department', '')
-                year = att_data.get('year', '')
-                section = att_data.get('section', '')
-                
-                # Create a more descriptive course name
-                if department and year and section:
-                    course_desc = f"{department} Year {year} Section {section}"
-                else:
-                    course_desc = course
-                
-                all_activities.append({
-                    'timestamp': timestamp,
-                    'date_str': date_str,
-                    'type': 'Attendance',
-                    'details': f"Marked {status} for {course_desc}"
-                })
-            
-            # Get library activity - without using order_by in Firestore
+            # First pass: Process return records to avoid duplicates
             library_ref = self.db.collection('library_records')
-            lib_query = library_ref.where(filter=firestore.FieldFilter('student_id', '==', student_id))
-            library = list(lib_query.get())
+            return_query = library_ref.where(
+                filter=firestore.FieldFilter('student_id', '==', student_id)
+            ).where(
+                filter=firestore.FieldFilter('status', 'in', ['returned', 'return_record'])
+            )
             
-            # Track which books have return records to avoid duplicates
-            books_with_return_records = set()
-            
-            # First pass - identify which books have dedicated return records
-            for lib in library:
-                lib_data = lib.to_dict()
-                if lib_data.get('status') == 'return_record':
-                    # Add to our tracking set - combine book_id and original_lent_date to ensure uniqueness
-                    book_id = lib_data.get('book_id', '')
-                    original_lent_date = lib_data.get('original_lent_date', '')
-                    books_with_return_records.add(f"{book_id}_{original_lent_date}")
-            
-            # Second pass - process all records
-            for lib in library:
-                lib_data = lib.to_dict()
-                timestamp = lib_data.get('timestamp')
-                if not timestamp:
-                    continue
+            for doc in return_query.get():
+                data = doc.to_dict()
+                book_id = data.get('book_id')
+                timestamp = data.get('return_timestamp')
+                book_title = data.get('book_title', 'Unknown book')
                 
-                date_str = timestamp.strftime("%Y-%m-%d %H:%M") if timestamp else "N/A"
-                book_title = lib_data.get('book_title', 'Unknown book')
-                status = lib_data.get('status')
-                book_id = lib_data.get('book_id', '')
-                lent_date = lib_data.get('lent_date', '')
-                
-                # Handle different record types
-                if status == 'lent':
-                    # Original lending record
-                    all_activities.append({
-                        'timestamp': timestamp,
-                        'date_str': date_str,
-                        'type': 'Library',
-                        'details': f"Borrowed '{book_title}'"
-                    })
-                
-                elif status == 'return_record':
-                    # This is a dedicated return record (new format)
-                    all_activities.append({
-                        'timestamp': timestamp,
-                        'date_str': date_str,
-                        'type': 'Library',
-                        'details': f"Returned '{book_title}'"
-                    })
-                
-                elif status == 'returned' and not f"{book_id}_{lent_date}" in books_with_return_records:
-                    # Old format records that have been updated with returned status
-                    # BUT ONLY if we don't already have a dedicated return record for this book
-                    # Get the return timestamp if available
-                    return_timestamp = lib_data.get('return_timestamp')
-                    return_date = lib_data.get('return_date')
-                    
-                    if return_timestamp:
-                        # Use the return timestamp for the activity
-                        if hasattr(return_timestamp, 'tzinfo') and return_timestamp.tzinfo is not None:
-                            return_timestamp = return_timestamp.replace(tzinfo=None)
-                        return_date_str = return_timestamp.strftime("%Y-%m-%d %H:%M")
-                    elif return_date:
-                        try:
-                            # Parse the return date
-                            if isinstance(return_date, str):
-                                if ' ' in return_date:  # Format: YYYY-MM-DD HH:MM:SS
-                                    return_timestamp = datetime.datetime.strptime(return_date, "%Y-%m-%d %H:%M:%S")
-                                else:  # Format: YYYY-MM-DD
-                                    return_timestamp = datetime.datetime.strptime(return_date, "%Y-%m-%d")
-                                return_date_str = return_timestamp.strftime("%Y-%m-%d %H:%M")
-                            else:
-                                return_date_str = return_date.strftime("%Y-%m-%d %H:%M") if return_date else date_str
-                        except Exception as e:
-                            print(f"Error parsing return date: {e}")
-                            return_date_str = date_str
-                            return_timestamp = timestamp
-                    else:
-                        return_date_str = date_str
-                        return_timestamp = timestamp
-                        
-                    # Add a separate activity for the return
-                    all_activities.append({
-                        'timestamp': return_timestamp,
-                        'date_str': return_date_str,
-                        'type': 'Library',
-                        'details': f"Returned '{book_title}'"
-                    })
-            
-            # Get bus activity - without using order_by in Firestore
-            bus_ref = self.db.collection('bus_activity')
-            bus_query = bus_ref.where(filter=firestore.FieldFilter('student_id', '==', student_id))
-            bus_activity = list(bus_query.get())
-            
-            for bus in bus_activity:
-                bus_data = bus.to_dict()
-                timestamp = bus_data.get('timestamp')
-                if not timestamp:
-                    continue
-                
-                date_str = timestamp.strftime("%Y-%m-%d %H:%M") if timestamp else "N/A"
-                
-                action = bus_data.get('action', 'unknown')
-                route_num = bus_data.get('route_num', 'Unknown')
-                
-                all_activities.append({
+                if book_id and timestamp:
+                    # Only keep the latest return record for each book
+                    if book_id not in returned_books or timestamp > returned_books[book_id]['timestamp']:
+                        returned_books[book_id] = {
                     'timestamp': timestamp,
-                    'date_str': date_str,
-                    'type': 'Transport',
-                    'details': f"{action} on route {route_num}"
+                            'title': book_title
+                        }
+            
+            # Add all unique return records to activity list
+            for book_id, info in returned_books.items():
+                timestamp = info['timestamp']
+                activity_list.append({
+                    'date': timestamp,
+                    'type': 'Library',
+                    'details': f"Returned: {info['title']}",
+                    'raw_timestamp': timestamp  # For sorting
                 })
             
-            # Sort all activities by timestamp (newest first)
-            # First normalize all timestamps to naive datetimes to avoid comparison errors
-            for activity in all_activities:
-                timestamp = activity['timestamp']
-                if timestamp and hasattr(timestamp, 'tzinfo') and timestamp.tzinfo is not None:
-                    # Convert timezone-aware datetime to naive
-                    activity['timestamp'] = timestamp.replace(tzinfo=None)
+            # Process ALL lending records - collect both active and returned lendings
+            # First get all lending records regardless of status
+            all_lendings_query = library_ref.where(
+                filter=firestore.FieldFilter('student_id', '==', student_id)
+            )
             
-            all_activities.sort(key=lambda x: x['timestamp'] if x['timestamp'] else datetime.datetime.min, reverse=True)
+            for doc in all_lendings_query.get():
+                data = doc.to_dict()
+                status = data.get('status')
+                timestamp = data.get('timestamp')
+                book_title = data.get('book_title', 'Unknown book')
+                due_date = data.get('due_date', 'Unknown')
+                book_id = data.get('book_id')
+                
+                # Include any record with a lending timestamp that's either marked as 'lent' 
+                # or has book_id and was not created as a return_record
+                if timestamp and ((status == 'lent') or (status == 'returned' and book_id and 'return_record' not in data.get('activity_type', ''))):
+                    activity_list.append({
+                        'date': timestamp,
+                        'type': 'Library',
+                        'details': f"Borrowed: {book_title} - Due: {due_date}",
+                        'raw_timestamp': timestamp  # For sorting
+                    })
             
-            # Display in treeview (limit to 10)
-            for i, activity in enumerate(all_activities[:10]):
-                tree.insert("", tk.END, values=(
-                    activity['date_str'],
-                    activity['type'],
-                    activity['details']
-                ))
+            # Fetch transactions without order_by
+            transactions_ref = self.db.collection('transactions')
+            transactions_query = transactions_ref.where(
+                filter=firestore.FieldFilter('student_id', '==', student_id)
+            )
+            
+            for doc in transactions_query.get():
+                data = doc.to_dict()
+                timestamp = data.get('timestamp')
+                if timestamp:
+                    activity_list.append({
+                        'date': timestamp,
+                        'type': 'Wallet',
+                        'details': f"{data.get('type', 'Transaction')}: {format_currency(data.get('amount', 0))} - {data.get('description', '')}",
+                        'raw_timestamp': timestamp  # For sorting
+                    })
+            
+            # Fetch bus records without order_by
+            bus_ref = self.db.collection('bus_logs')
+            bus_query = bus_ref.where(
+                filter=firestore.FieldFilter('student_id', '==', student_id)
+            )
+            
+            for doc in bus_query.get():
+                data = doc.to_dict()
+                timestamp = data.get('timestamp')
+                if timestamp:
+                    activity_list.append({
+                        'date': timestamp,
+                        'type': 'Bus',
+                        'details': f"{data.get('direction', 'Boarding')}: {data.get('route_name', 'Unknown route')}",
+                        'raw_timestamp': timestamp  # For sorting
+                    })
+            
+            # Fetch attendance records without order_by
+            attendance_ref = self.db.collection('attendance')
+            attendance_query = attendance_ref.where(
+                filter=firestore.FieldFilter('student_id', '==', student_id)
+            )
+            
+            for doc in attendance_query.get():
+                data = doc.to_dict()
+                timestamp = data.get('timestamp')
+                if timestamp:
+                    activity_list.append({
+                        'date': timestamp,
+                        'type': 'Attendance',
+                        'details': f"{data.get('status', 'Present')} - {data.get('class_name', 'Unknown class')}",
+                        'raw_timestamp': timestamp  # For sorting
+                    })
+            
+            # Sort by timestamp (most recent first) - do the sorting in our code instead of the database
+            activity_list.sort(key=lambda x: x['raw_timestamp'], reverse=True)
+            
+            # Add to treeview (limit to most recent items)
+            for i, activity in enumerate(activity_list[:20]):  # Limit to 20 most recent
+                date_str = activity['date'].strftime("%Y-%m-%d %H:%M:%S")
+                tree.insert("", tk.END, values=(date_str, activity['type'], activity['details']))
+            
+            # If no activities found, show message
+            if not activity_list:
+                tree.insert("", tk.END, values=("N/A", "N/A", "No recent activity found."))
                 
         except Exception as e:
             print(f"Error loading recent activity: {e}")
+            import traceback
+            traceback.print_exc()
             tree.insert("", tk.END, values=("Error", "Error", f"Failed to load activities: {str(e)}")) 
+
+    def show_student_menu(self):
+        """Show the student menu after viewing detailed info"""
+        # Clear the window
+        for widget in self.root.winfo_children():
+            widget.destroy()
+        
+        # Recreate the main frame
+        self.main_frame = ttk.Frame(self.root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Show the RFID input screen
+        self.show_rfid_input() 

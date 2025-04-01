@@ -74,227 +74,210 @@ from components.student_ui import StudentUI
 
 # Function to initialize database with sample data
 def initialize_database():
-    """
-    Initialize the Firebase database with sample data for testing.
-    This will set up the necessary collections and documents.
-    """
-    print("Initializing Firebase database with sample data...")
+    """Initialize database with sample data."""
+    db = firestore.client()
     
-    try:
-        # Check if already initialized
-        if firebase_admin._apps:
-            database = firestore.client()
-        else:
-            # Initialize Firebase
-            cred = credentials.Certificate("serviceAccountKey.json")
-            firebase_admin.initialize_app(cred)
-            database = firestore.client()
-        
-        # Sample Students
-        students_data = [
-            {
-                "rfid": "0001234567",
-                "name": "John Doe",
-                "email": "john.doe@example.com",
-                "department": "Computer Science",
-                "year": 3,
-                "section": "A",
-                "wallet_balance": 500.0,
-                "parent_email": "parent.doe@example.com",
-                "photo_url": "",
-                "pin": "1234",  # In a real app, this would be hashed
-                "bus_route": "Route 1"
-            },
-            {
-                "rfid": "0002345678",
-                "name": "Jane Smith",
-                "email": "jane.smith@example.com",
-                "department": "Electrical Engineering",
-                "year": 2,
-                "section": "B",
-                "wallet_balance": 750.0,
-                "parent_email": "parent.smith@example.com",
-                "photo_url": "",
-                "pin": "5678",
-                "bus_route": "Route 2"
-            },
-            {
-                "rfid": "0003456789",
-                "name": "Alex Johnson",
-                "email": "alex.johnson@example.com",
-                "department": "Mechanical Engineering",
-                "year": 4,
-                "section": "C",
-                "wallet_balance": 350.0,
-                "parent_email": "parent.johnson@example.com",
-                "photo_url": "",
-                "pin": "9012",
-                "bus_route": "Route 3"
-            }
-        ]
-        
-        # Sample admin
-        admin_data = {
-            "rfid": "0006435835",
-            "name": "Admin User",
-            "email": "admin@example.com",
-            "role": "admin",
-            "pin": "0000"
+    print("Initializing database with sample data...")
+    
+    # Check if data already exists
+    students_ref = db.collection('students')
+    students = students_ref.limit(1).get()
+    
+    if len(list(students)) > 0:
+        print("Database already contains data, skipping initialization.")
+        return
+    
+    # Sample Admin
+    admin_data = {
+        'name': 'Admin User',
+        'email': 'admin@example.com',
+        'rfid': '0006435835',
+        'pin': '1234',
+        'role': 'admin',
+        'department': 'Administration',
+        'created_at': datetime.datetime.now()
+    }
+    
+    # Sample Students
+    students_data = [
+        {
+            'name': 'John Doe',
+            'email': 'john.doe@example.com',
+            'rfid': '0001234567',
+            'pin': '1234',
+            'department': 'Computer Science',
+            'year': '3rd',
+            'wallet_balance': 1500.00,
+            'face_data': None,
+            'created_at': datetime.datetime.now()
+        },
+        {
+            'name': 'Jane Smith',
+            'email': 'jane.smith@example.com',
+            'rfid': '0002345678',
+            'pin': '5678',
+            'department': 'Electrical Engineering',
+            'year': '2nd',
+            'wallet_balance': 1000.00,
+            'face_data': None,
+            'created_at': datetime.datetime.now()
+        },
+        {
+            'name': 'Alex Johnson',
+            'email': 'alex.johnson@example.com',
+            'rfid': '0003456789',
+            'pin': '9012',
+            'department': 'Mechanical Engineering',
+            'year': '4th',
+            'wallet_balance': 1200.00,
+            'face_data': None,
+            'created_at': datetime.datetime.now()
         }
-        
-        # Sample Bus Routes
-        bus_routes_data = [
-            {
-                "route_id": "Route 1",
-                "name": "City Center Route",
-                "stops": ["Campus", "Library", "Downtown", "Mall", "Apartments"]
-            },
-            {
-                "route_id": "Route 2",
-                "name": "Suburban Route",
-                "stops": ["Campus", "West Housing", "Shopping Center", "Park", "East Housing"]
-            },
-            {
-                "route_id": "Route 3",
-                "name": "Express Route",
-                "stops": ["Campus", "Main Station", "Airport"]
-            }
-        ]
-        
-        # Sample Books
-        books_data = [
-            {
-                "book_id": "B001",
-                "title": "Introduction to Python Programming",
-                "author": "John Smith",
-                "category": "Computer Science",
-                "available": True
-            },
-            {
-                "book_id": "B002",
-                "title": "Database Management Systems",
-                "author": "Mary Johnson",
-                "category": "Computer Science",
-                "available": True
-            },
-            {
-                "book_id": "B003",
-                "title": "Circuit Analysis",
-                "author": "Robert Williams",
-                "category": "Electrical Engineering",
-                "available": True
-            },
-            {
-                "book_id": "B004",
-                "title": "Thermodynamics Fundamentals",
-                "author": "James Wilson",
-                "category": "Mechanical Engineering",
-                "available": True
-            }
-        ]
-        
-        # Sample Attendance (for today)
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
-        attendance_data = [
-            {
-                "student_id": "0001234567",
-                "date": today,
-                "department": "Computer Science",
-                "year": 3,
-                "section": "A",
-                "status": "present",
-                "timestamp": firestore.SERVER_TIMESTAMP
-            },
-            {
-                "student_id": "0002345678",
-                "date": today,
-                "department": "Electrical Engineering",
-                "year": 2,
-                "section": "B",
-                "status": "present",
-                "timestamp": firestore.SERVER_TIMESTAMP
-            }
-        ]
-        
-        # Sample Transactions
-        transactions_data = [
-            {
-                "student_id": "0001234567",
-                "amount": -50.0,
-                "type": "debit",
-                "description": "Canteen purchase",
-                "timestamp": firestore.SERVER_TIMESTAMP,
-                "location": "Canteen"
-            },
-            {
-                "student_id": "0001234567",
-                "amount": 200.0,
-                "type": "credit",
-                "description": "Wallet recharge",
-                "timestamp": firestore.SERVER_TIMESTAMP,
-                "location": "Canteen"
-            },
-            {
-                "student_id": "0002345678",
-                "amount": -75.0,
-                "type": "debit",
-                "description": "Canteen purchase",
-                "timestamp": firestore.SERVER_TIMESTAMP,
-                "location": "Canteen"
-            }
-        ]
-        
-        # Sample Library Records
-        library_records_data = [
-            {
-                "student_id": "0003456789",
-                "book_id": "B003",
-                "issue_date": (datetime.datetime.now() - datetime.timedelta(days=5)).strftime("%Y-%m-%d"),
-                "due_date": (datetime.datetime.now() + datetime.timedelta(days=10)).strftime("%Y-%m-%d"),
-                "return_date": None,
-                "status": "borrowed"
-            }
-        ]
-        
-        # Sample Bus Activity
-        bus_activity_data = [
-            {
-                "student_id": "0002345678",
-                "route_id": "Route 2",
-                "action": "boarding",
-                "timestamp": firestore.SERVER_TIMESTAMP,
-                "location": "Campus"
-            }
-        ]
-        
-        # Function to add data to collection
-        def add_collection_data(collection_name, data_list):
-            for data in data_list:
-                # For students and admin, use RFID as document ID
-                if collection_name == "students" and "rfid" in data:
-                    database.collection(collection_name).document(data["rfid"]).set(data)
-                else:
-                    database.collection(collection_name).add(data)
-            print(f"Added {len(data_list)} documents to {collection_name} collection")
-        
-        # Add data to collections
-        add_collection_data("students", students_data)
-        database.collection("students").document(admin_data["rfid"]).set(admin_data)
-        print(f"Added admin user to students collection")
-        
-        add_collection_data("bus_routes", bus_routes_data)
-        add_collection_data("books", books_data)
-        add_collection_data("attendance", attendance_data)
-        add_collection_data("transactions", transactions_data)
-        add_collection_data("library_records", library_records_data)
-        add_collection_data("bus_activity", bus_activity_data)
-        
-        print("Database initialization completed successfully!")
-        return True
+    ]
     
-    except Exception as e:
-        print(f"Error initializing database: {e}")
-        return False
+    # Sample Routes
+    routes_data = [
+        {
+            'name': 'Campus to Downtown',
+            'start_point': 'Campus Main Gate',
+            'end_point': 'Downtown Station',
+            'stops': ['Science Building', 'Library', 'University Hospital', 'Market Square'],
+            'fare': 25.00,
+            'schedule': [
+                {'departure': '08:00', 'arrival': '08:45'},
+                {'departure': '12:00', 'arrival': '12:45'},
+                {'departure': '16:00', 'arrival': '16:45'}
+            ]
+        },
+        {
+            'name': 'Suburban Route',
+            'start_point': 'Campus',
+            'end_point': 'East Housing',
+            'stops': ['Campus', 'West Housing', 'Shopping Center', 'Park', 'East Housing'],
+            'fare': 15.00,
+            'schedule': [
+                {'departure': '07:00', 'arrival': '07:45'},
+                {'departure': '13:00', 'arrival': '13:45'},
+                {'departure': '18:00', 'arrival': '18:45'}
+            ]
+        },
+        {
+            'name': 'Express Route',
+            'start_point': 'Campus',
+            'end_point': 'Airport',
+            'stops': ['Campus', 'Main Station', 'Airport'],
+            'fare': 50.00,
+            'schedule': [
+                {'departure': '06:00', 'arrival': '06:45'},
+                {'departure': '10:00', 'arrival': '10:45'},
+                {'departure': '14:00', 'arrival': '14:45'}
+            ]
+        }
+    ]
+    
+    # Sample Books
+    books_data = [
+        {
+            'book_id': 'CS101',
+            'title': 'Introduction to Computer Science',
+            'author': 'Dr. Jane Smith',
+            'publisher': 'Academic Press',
+            'year': 2020,
+            'category': 'Computer Science',
+            'available': True,
+            'status': 'available'
+        },
+        {
+            'book_id': 'DB101',
+            'title': 'Database Management Systems',
+            'author': 'Mary Johnson',
+            'publisher': 'Academic Press',
+            'year': 2021,
+            'category': 'Computer Science',
+            'available': True,
+            'status': 'available'
+        },
+        {
+            'book_id': 'ME101',
+            'title': 'Circuit Analysis',
+            'author': 'Robert Williams',
+            'publisher': 'Academic Press',
+            'year': 2022,
+            'category': 'Electrical Engineering',
+            'available': True,
+            'status': 'available'
+        },
+        {
+            'book_id': 'ME201',
+            'title': 'Thermodynamics Fundamentals',
+            'author': 'James Wilson',
+            'publisher': 'Academic Press',
+            'year': 2023,
+            'category': 'Mechanical Engineering',
+            'available': True,
+            'status': 'available'
+        }
+    ]
+    
+    # Sample Transactions
+    transactions_data = [
+        {
+            'student_id': '',  # Will be filled after student creation
+            'student_name': 'John Doe',
+            'type': 'credit',
+            'amount': 1000.00,
+            'description': 'Initial wallet credit',
+            'location': 'Admin Office',
+            'timestamp': datetime.datetime.now() - datetime.timedelta(days=5)
+        },
+        {
+            'student_id': '',
+            'student_name': 'Jane Smith',
+            'type': 'credit',
+            'amount': 1000.00,
+            'description': 'Initial wallet credit',
+            'location': 'Admin Office',
+            'timestamp': datetime.datetime.now() - datetime.timedelta(days=5)
+        },
+        {
+            'student_id': '',
+            'student_name': 'Alex Johnson',
+            'type': 'credit',
+            'amount': 1000.00,
+            'description': 'Initial wallet credit',
+            'location': 'Admin Office',
+            'timestamp': datetime.datetime.now() - datetime.timedelta(days=5)
+        }
+    ]
+    
+    # Sample Lendings (initially empty)
+    lendings_data = []
+    
+    # Sample Returns (initially empty)
+    returns_data = []
+    
+    # Helper function to add data to a collection
+    def add_collection_data(collection_name, data_list):
+        collection_ref = db.collection(collection_name)
+        for data in data_list:
+            doc_ref = collection_ref.add(data)
+            print(f"Added document {doc_ref[1].id} to {collection_name}")
+            if collection_name == 'students' and 'name' in data and data['name'] == 'John Doe':
+                # Update transaction with student ID
+                for tx in transactions_data:
+                    if tx['student_name'] == 'John Doe':
+                        tx['student_id'] = doc_ref[1].id
+    
+    # Add data to collections
+    add_collection_data("admin", [admin_data])
+    add_collection_data("students", students_data)
+    add_collection_data("routes", routes_data)
+    add_collection_data("books", books_data)
+    add_collection_data("transactions", transactions_data)
+    add_collection_data("lendings", lendings_data)
+    add_collection_data("returns", returns_data)
+    
+    print("Database initialized successfully with sample data.")
 
 class RFIDApp:
     def __init__(self, root):

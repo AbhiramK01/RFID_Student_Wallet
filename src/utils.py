@@ -131,27 +131,45 @@ def get_spending_pattern(db, student_id, days=30):
         today = datetime.datetime.now()
         start_date = today - datetime.timedelta(days=days)
         
+        # Use only student_id filter in the Firestore query
         transactions_ref = db.collection('transactions')
         query = transactions_ref.where(
             filter=firestore.FieldFilter('student_id', '==', student_id)
-        ).where(
-            filter=firestore.FieldFilter('timestamp', '>=', start_date)
-        ).where(
-            filter=firestore.FieldFilter('type', '==', 'debit')
         )
         
-        transactions = query.get()
-        
+        # Get all transactions and filter in memory
+        transactions = list(query.get())
         if not transactions:
             return None
             
+        # Filter by date and type in Python
+        filtered_transactions = []
+        for tx_doc in transactions:
+            tx_data = tx_doc.to_dict()
+            tx_timestamp = tx_data.get('timestamp')
+            tx_type = tx_data.get('type')
+            
+            # Handle timezone awareness issue - convert both to naive datetime for comparison
+            # or skip comparison if timestamp is missing
+            if tx_timestamp:
+                # If timestamp is timezone-aware, convert to naive by replacing tzinfo
+                if hasattr(tx_timestamp, 'tzinfo') and tx_timestamp.tzinfo is not None:
+                    naive_timestamp = tx_timestamp.replace(tzinfo=None)
+                else:
+                    naive_timestamp = tx_timestamp
+                    
+                if naive_timestamp >= start_date and tx_type == 'debit':
+                    filtered_transactions.append(tx_data)
+            
+        # If no relevant transactions found after filtering
+        if not filtered_transactions:
+            return None
+            
         total_amount = 0
-        transaction_count = 0
+        transaction_count = len(filtered_transactions)
         
-        for tx in transactions:
-            tx_data = tx.to_dict()
+        for tx_data in filtered_transactions:
             total_amount += tx_data.get('amount', 0)
-            transaction_count += 1
         
         if transaction_count == 0:
             return None
@@ -179,44 +197,181 @@ def recommend_recharge_amount(spending_pattern):
     recommendation = spending_pattern['weekly_avg'] * 2
     return round(recommendation / 100) * 100
 
-def get_similar_books(db, current_book_id):
-    """Get book recommendations based on others' reading patterns"""
+def get_similar_books(db, book_id):
+    """Get similar books based on lending history ("users who read this also read") or category"""
     try:
-        # This is a simplified recommendation engine
-        # In a real application, this would be more sophisticated
+        # First, get the current book's details
+        book_ref = db.collection('books').document(book_id)
+        book_doc = book_ref.get()
         
-        # Get book details
-        book_ref = db.collection('books').document(current_book_id)
-        book = book_ref.get()
-        
-        if not book.exists:
-            return []
+        if not book_doc.exists:
+            # Try to search by the book_id field instead of document ID
+            books_query = db.collection('books').where(
+                filter=firestore.FieldFilter('book_id', '==', book_id)
+            ).limit(1)
+            book_results = list(books_query.get())
+            if not book_results:
+                return []
+            book_doc = book_results[0]
             
-        book_data = book.to_dict()
-        category = book_data.get('category', '')
+        current_book = book_doc.to_dict()
+        current_category = current_book.get('category')
         
-        # Find books with the same category
-        books_ref = db.collection('books')
-        query = books_ref.where(
-            filter=firestore.FieldFilter('category', '==', category)
+        # Get lending history for this book
+        lending_ref = db.collection('lendings')
+        query = lending_ref.where(
+            filter=firestore.FieldFilter('book_id', '==', book_id)
         ).where(
-            filter=firestore.FieldFilter('id', '!=', current_book_id)
-        ).limit(3)
+            filter=firestore.FieldFilter('status', '==', 'returned')
+        )
         
-        books = query.get()
+        lending_results = list(query.get())
         
-        recommendations = []
-        for book in books:
-            book_data = book.to_dict()
-            recommendations.append({
-                'id': book.id,
-                'title': book_data.get('title', 'Unknown Book'),
-                'author': book_data.get('author', 'Unknown Author')
-            })
+        # If no results found, try with the document ID
+        if not lending_results:
+            query = lending_ref.where(
+                filter=firestore.FieldFilter('book_id', '==', book_doc.id)
+            ).where(
+                filter=firestore.FieldFilter('status', '==', 'returned')
+            )
+            lending_results = list(query.get())
+        
+        student_ids = set()
+        
+        # Collect student IDs who have borrowed this book
+        for doc in lending_results:
+            student_id = doc.to_dict().get('student_id')
+            if student_id:
+                student_ids.add(student_id)
+        
+        similar_books = []
+        book_scores = {}  # book_id -> score
+        
+        if student_ids:
+            # Find other books borrowed by these students - "users who read this also read"
+            for student_id in student_ids:
+                student_query = lending_ref.where(
+                    filter=firestore.FieldFilter('student_id', '==', student_id)
+                ).where(
+                    filter=firestore.FieldFilter('status', '==', 'returned')
+                )
+                
+                for doc in student_query.get():
+                    lending_data = doc.to_dict()
+                    other_book_id = lending_data.get('book_id')
+                    if other_book_id and other_book_id != book_id and other_book_id != book_doc.id:
+                        if other_book_id not in book_scores:
+                            book_scores[other_book_id] = 0
+                        book_scores[other_book_id] += 1
             
+            # Sort books by how many students borrowed them
+            sorted_books = sorted(book_scores.items(), key=lambda x: x[1], reverse=True)
+            
+            # Get book details for the most frequently borrowed books
+            for other_book_id, score in sorted_books[:5]:  # Get top 5
+                other_book_ref = db.collection('books').document(other_book_id)
+                other_book_doc = other_book_ref.get()
+                
+                if other_book_doc.exists:
+                    other_book = other_book_doc.to_dict()
+                    other_book['id'] = other_book_doc.id
+                    if other_book.get('available', True):  # Only recommend available books
+                        similar_books.append(other_book)
+        
+        # If we don't have enough recommendations from lending history,
+        # fall back to category-based recommendations
+        if len(similar_books) < 3 and current_category:
+            category_query = db.collection('books').where(
+                filter=firestore.FieldFilter('category', '==', current_category)
+            ).where(
+                filter=firestore.FieldFilter('available', '==', True)
+            ).limit(10)
+            
+            for doc in category_query.get():
+                book_data = doc.to_dict()
+                book_data['id'] = doc.id
+                book_doc_id = doc.id
+                doc_book_id = book_data.get('book_id', book_doc_id)
+                
+                # Skip the current book and books already in similar_books
+                if (doc_book_id != book_id and book_doc_id != book_id and 
+                    not any(b.get('id') == book_doc_id for b in similar_books)):
+                    similar_books.append(book_data)
+        
+        # Randomly select 3 books if we have more
+        if len(similar_books) > 3:
+            return random.sample(similar_books, 3)
+        return similar_books
+        
+    except Exception as e:
+        print(f"Error getting similar books: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+def get_book_recommendations(db, student_id):
+    """Get personalized book recommendations based on student's reading history"""
+    try:
+        # Get student's lending history
+        lending_ref = db.collection('lendings')
+        query = lending_ref.where(
+            filter=firestore.FieldFilter('student_id', '==', student_id)
+        ).where(
+            filter=firestore.FieldFilter('status', '==', 'returned')
+        )
+        
+        lending_results = query.get()
+        if not lending_results:
+            return []
+        
+        # Collect categories of books the student has read and the book IDs they've read
+        read_categories = set()
+        read_book_ids = set()
+        
+        for doc in lending_results:
+            lending_data = doc.to_dict()
+            book_id = lending_data.get('book_id')
+            if book_id:
+                read_book_ids.add(book_id)
+                book_ref = db.collection('books').document(book_id)
+                book_doc = book_ref.get()
+                if book_doc.exists:
+                    book_data = book_doc.to_dict()
+                    category = book_data.get('category')
+                    if category:
+                        read_categories.add(category)
+        
+        if not read_categories:
+            return []
+        
+        # Get recommendations from the same categories
+        recommendations = []
+        for category in read_categories:
+            category_query = db.collection('books').where(
+                filter=firestore.FieldFilter('category', '==', category)
+            ).where(
+                filter=firestore.FieldFilter('available', '==', True)
+            ).limit(10)  # Get more books per category for better randomization
+            
+            for doc in category_query.get():
+                book_data = doc.to_dict()
+                book_data['id'] = doc.id
+                book_doc_id = doc.id
+                doc_book_id = book_data.get('book_id', book_doc_id)
+                
+                # Don't recommend books the student has already read
+                if doc_book_id not in read_book_ids and book_doc_id not in read_book_ids:
+                    recommendations.append(book_data)
+        
+        # Randomly select 3 books if we have more
+        if len(recommendations) > 3:
+            return random.sample(recommendations, 3)
         return recommendations
+        
     except Exception as e:
         print(f"Error getting book recommendations: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 # Face Recognition Utilities
