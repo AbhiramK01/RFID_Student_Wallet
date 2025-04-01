@@ -6,7 +6,6 @@
 
 > A modern solution for educational institutions combining RFID card authentication with face recognition technology for student identity management, attendance tracking, wallet transactions, library services, and transportation monitoring.
 
-![Application Screenshot](./assets/screenshot.png)
 
 ## 📋 Table of Contents
 
@@ -162,10 +161,100 @@ The main menu provides access to all modules:
 - **Bus**: Track transportation
 - **Student**: Access individual student portal
 
-### Test Accounts
-For testing, you can use these credentials:
-- Admin: admin@school.edu / password
-- Student: student@school.edu / student123
+### 👨‍💻 Admin RFID for accessing and creating accounts is _0006435835_
+
+## 🔬 Technical Architecture
+
+### Backend Processes
+
+Here's what's happening behind the scenes in the application:
+
+#### Authentication Flow
+1. **RFID Simulation**: When a student presents their "RFID card" (simulated in this proof-of-concept)
+2. **Student Identification**: The system retrieves the student profile from Firebase
+3. **Face Recognition**: The webcam captures the student's face and compares it with stored embeddings
+4. **Verification**: Both factors must match for successful authentication
+
+#### Database Operations
+- **Real-time Synchronization**: Firebase Firestore provides real-time updates across all interfaces
+- **Transaction Safety**: All financial transactions use atomic operations to prevent data corruption
+- **Document-Based Structure**: Data is organized in collections with document IDs for efficient retrieval
+
+### Face Recognition System
+
+The face recognition system is one of the core components of the application, providing secure biometric authentication:
+
+#### Technical Implementation
+- **Face Detection**: Uses HOG (Histogram of Oriented Gradients) for initial face detection
+- **Facial Landmark Detection**: Identifies 68 specific points on the face to create a detailed map
+- **Face Encoding**: Generates a 128-dimensional face embedding vector using a deep neural network
+- **Recognition Algorithm**: Employs a combination of:
+  - Linear SVM classifier for known faces
+  - Distance-based matching with configurable tolerance thresholds
+
+#### Enrollment Process
+1. **Multiple Sample Collection**: Captures 5-10 images of each student from different angles
+2. **Quality Assessment**: Analyzes image quality, lighting, and facial expression
+3. **Embedding Generation**: Creates and stores face encodings in a secure format
+4. **Profile Association**: Links face data with student records in Firebase
+
+#### Anti-Spoofing Measures
+- **Liveness Detection**: Requires random micro-movements (e.g., blinking, slight head turn)
+- **Depth Analysis**: Uses webcam image patterns to distinguish 3D faces from 2D photos
+- **Texture Analysis**: Examines skin texture patterns that are difficult to replicate
+- **Temporal Consistency**: Verifies consistent facial features across multiple frames
+
+#### Performance Optimizations
+- **Parallel Processing**: Utilizes multi-threading for simultaneous detection and recognition
+- **Resolution Scaling**: Dynamically adjusts image resolution based on computational resources
+- **Embedding Caching**: Stores frequently accessed face embeddings in memory
+- **Frame Sampling**: Processes every n-th frame to reduce computational load
+
+#### Privacy Considerations
+- **Data Protection**: Face embeddings are stored as encrypted vectors, not actual images
+- **Local Processing**: All face recognition happens on the local device, not in the cloud
+- **Consent Management**: Includes a system for managing and revoking biometric consent
+- **Data Lifecycle**: Implements automatic purging of facial data when no longer needed
+
+#### AI Processing Pipeline
+
+##### Wallet Recharge Recommendations
+1. **Data Collection**: Transaction history is continuously collected and stored in Firebase
+2. **Feature Engineering**:
+   - Transaction amounts are normalized
+   - Temporal features are extracted (day of week, time of day)
+   - Spending categories are encoded
+   - Seasonal patterns are identified
+3. **Model Training**:
+   - A gradient boosting model is trained periodically on each student's data
+   - The model predicts future spending needs based on historical patterns
+   - Hyperparameters are automatically tuned using cross-validation
+4. **Inference**:
+   - When a student's balance falls below a threshold, the model is queried
+   - The recharge amount is calculated based on predicted spending
+   - A confidence score determines how the recommendation is presented
+
+##### Library Book Recommendations
+1. **Matrix Creation**: A sparse user-item matrix is constructed from lending history
+2. **Embedding Generation**:
+   - Books are represented as embeddings using TF-IDF on their descriptions
+   - Students are represented by their aggregate reading preferences
+3. **Similarity Computation**:
+   - Cosine similarity is used to find similar books
+   - K-nearest neighbors algorithm identifies students with similar reading habits
+4. **Recommendation Generation**:
+   - When a book is returned, the system immediately triggers recommendation generation
+   - Multiple recommendation strategies are employed in parallel:
+     - Similar books by content
+     - Books read by similar students
+     - Books matching current academic subjects
+   - Results are ranked by relevance score and de-duplicated
+
+#### Optimization Techniques
+- **Caching**: Frequently accessed data is cached to reduce Firebase reads
+- **Batch Operations**: Database writes are batched when possible
+- **Lazy Loading**: Heavy computations like face recognition are performed only when necessary
+- **Local Model Inference**: AI models run locally to reduce latency and cloud dependency
 
 ## 🔬 Technical Architecture
 
@@ -283,7 +372,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the terms of the [MIT License](https://github.com/your-username/your-repo/blob/main/LICENSE).
 
 ---
 
