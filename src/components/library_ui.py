@@ -7,6 +7,7 @@ from utils import validate_rfid, validate_pin, get_student_by_rfid, get_similar_
 import datetime
 from google.cloud import firestore
 import csv
+import threading
 
 class LibraryUI:
     def __init__(self, root, db, return_callback):
@@ -544,6 +545,8 @@ class LibraryUI:
             import traceback
             traceback.print_exc()
             messagebox.showerror("Error", f"An error occurred: {str(e)}")
+        
+        self.root.update()
     
     def process_return(self):
         """Process the book return"""
@@ -552,45 +555,58 @@ class LibraryUI:
             return
         
         try:
+            # Show a loading indicator
+            self.root.config(cursor="wait")
+            self.root.update()
+            
             book_id = self.return_book_data['id']  # This is the document ID
             book_id_field = self.return_book_data.get('book_id', book_id)  # Use the book_id field if available
+            
+            # Create a batch for all Firestore operations
+            batch = self.db.batch()
             
             # Update book status to available
             book_ref = self.db.collection('books').document(book_id)
             book_doc = book_ref.get()
             
             if not book_doc.exists:
+                self.root.config(cursor="")
                 messagebox.showerror("Error", "Book not found in database.")
                 return
-            
-            # Update book status to available
-            book_ref.update({
-                'status': 'available',
-                'lent_to': None,
-                'lent_date': None,
-                'due_date': None,
-                'available': True,
-                'last_updated': datetime.datetime.now()
-            })
-            
+                
+            # Update book status
             now = datetime.datetime.now()
             return_date = now.strftime("%Y-%m-%d")
             student_id = self.return_book_data.get('student_id')
             student_name = self.return_book_data.get('lent_to', 'Unknown')
             book_title = self.return_book_data.get('title', 'Unknown Book')
             
-            # Update lending record if we have a lending_id
+            # Add book update to batch
+            batch.update(book_ref, {
+                'status': 'available',
+                'lent_to': None,
+                'lent_date': None,
+                'due_date': None,
+                'available': True,
+                'last_updated': now
+            })
+            
+            # Track which records were updated
             lending_record_id = None
+            library_record_updated = False
+            
+            # Process lending record - prefer the one in return_book_data
             if 'lending_id' in self.return_book_data:
                 lending_ref = self.db.collection('lendings').document(self.return_book_data['lending_id'])
-                lending_ref.update({
+                # Add lending update to batch
+                batch.update(lending_ref, {
                     'status': 'returned',
                     'return_date': return_date,
                     'return_timestamp': now
                 })
                 lending_record_id = self.return_book_data['lending_id']
             else:
-                # Try to find the lending record
+                # Try to find the lending record - limit to 1 to improve performance
                 lending_query = self.db.collection('lendings').where(
                     filter=firestore.FieldFilter('book_id', '==', book_id_field)
             ).where(
@@ -606,96 +622,220 @@ class LibraryUI:
                     student_name = lending_data.get('student_name', student_name)
                     lending_record_id = lending_doc.id
                     
-                    # Update lending record
-                    lending_doc.reference.update({
+                    # Add lending update to batch
+                    batch.update(lending_doc.reference, {
                     'status': 'returned',
                         'return_date': return_date,
                     'return_timestamp': now
                 })
                 
-            # Update library_records if we have a library_record_id - DO NOT DELETE LENDING RECORD
-            library_record_updated = False
+            # Update library_records if we have a library_record_id
             if 'library_record_id' in self.return_book_data:
                 record_ref = self.db.collection('library_records').document(self.return_book_data['library_record_id'])
-                record_ref.update({
+                # Add record update to batch
+                batch.update(record_ref, {
                     'status': 'returned',
                     'return_date': return_date,
                     'return_timestamp': now
                 })
                 library_record_updated = True
             else:
-                # Try to find library_records record
+                # Only perform this query if no record ID was found earlier
+                # Limit to 3 records to improve performance (in case of duplicates)
                 records_query = self.db.collection('library_records').where(
                     filter=firestore.FieldFilter('book_id', '==', book_id_field)
                 ).where(
                     filter=firestore.FieldFilter('status', '==', 'lent')
-                )
+                ).limit(3)
                 
                 records_results = list(records_query.get())
                 
                 for record_doc in records_results:
-                    # Update each matching record (in case there are duplicates)
-                    record_doc.reference.update({
+                    # Add each record update to batch
+                    batch.update(record_doc.reference, {
                         'status': 'returned',
                         'return_date': return_date,
                         'return_timestamp': now
                     })
                     library_record_updated = True
             
-            # Create a single return record in the returns collection
+            # Create a single return record
             return_data = {
-                'book_id': book_id_field,  # Use the book_id field instead of document ID
+                'book_id': book_id_field,
                 'book_title': book_title,
                 'student_id': student_id,
                 'student_name': student_name,
                 'return_date': return_date,
                 'return_timestamp': now,
-                'status': 'return_record',  # Mark this as a return record
-                'lending_record_id': lending_record_id,  # Link to the original lending record
-                'activity_type': 'book_return'  # For activity tracking
+                'status': 'return_record',
+                'lending_record_id': lending_record_id,
+                'activity_type': 'book_return'
             }
             
             # Add to returns collection
-            returns_ref = self.db.collection('returns')
-            return_doc = returns_ref.add(return_data)
+            return_doc_ref = self.db.collection('returns').document()
+            batch.set(return_doc_ref, return_data)
             
             # Only add to library_records if no existing record was updated
-            # This prevents duplicate return records
             if not library_record_updated:
-                self.db.collection('library_records').add(return_data)
+                library_record_ref = self.db.collection('library_records').document()
+                batch.set(library_record_ref, return_data)
             
-            # Get book recommendations based on lending history
-            similar_books = get_similar_books(self.db, book_id_field)  # Use book_id_field for recommendations
-            user_recommendations = []
+            # Commit all changes at once
+            batch.commit()
             
-            if student_id:
-                user_recommendations = get_book_recommendations(self.db, student_id)
+            # Reset cursor
+            self.root.config(cursor="")
             
             # Store the return book data before clearing it
             return_book_data_copy = self.return_book_data
+            book_title_copy = book_title
             
             # Clear the return data
             self.return_book_data = None
             
-            # Set flag for recommendation window
-            self.recommendation_window_shown = False
+            # Initialize flag to track if recommendation window was closed
+            self.recommendation_window_closed = False
             
-            # Show a combined success and recommendations window
-            # This will block until the window is closed
-            self.show_return_success_with_recommendations(
-                book_title,
-                similar_books,
-                user_recommendations
-            )
+            # Start recommendation generation in a separate thread for better performance
+            threading.Thread(
+                target=self._process_recommendations,
+                args=(book_id_field, student_id, book_title_copy),
+                daemon=True
+            ).start()
             
-            # Now that the recommendations window is closed, refresh the return UI
-            self.show_return_ui()
+            # Note: We don't refresh the UI here anymore - it will be refreshed when 
+            # the recommendation window is closed via the _close_recommendation_window method
             
         except Exception as e:
+            # Reset cursor
+            self.root.config(cursor="")
+            
             print(f"Error processing return: {e}")
             import traceback
             traceback.print_exc()
             messagebox.showerror("Error", f"An error occurred while processing the return: {str(e)}")
+    
+    def _process_recommendations(self, book_id, student_id, book_title):
+        """Process recommendations in a separate thread"""
+        try:
+            # Create a loading window first
+            loading_window = tk.Toplevel(self.root)
+            loading_window.title("Preparing Recommendations")
+            loading_window.geometry("400x200")
+            loading_window.transient(self.root)  # Set as transient to main window
+            loading_window.grab_set()  # Make window modal
+            loading_window.resizable(False, False)
+            
+            # Center the loading window
+            window_width = 400
+            window_height = 200
+            screen_width = loading_window.winfo_screenwidth()
+            screen_height = loading_window.winfo_screenheight()
+            center_x = int(screen_width/2 - window_width/2)
+            center_y = int(screen_height/2 - window_height/2)
+            loading_window.geometry(f'{window_width}x{window_height}+{center_x}+{center_y}')
+            
+            # Create a frame for loading animation
+            loading_frame = ttk.Frame(loading_window, padding=20)
+            loading_frame.pack(fill=tk.BOTH, expand=True)
+            
+            # Add success message
+            ttk.Label(loading_frame, text=f"Book '{book_title}' has been returned successfully!", 
+                    font=('Arial', 12, 'bold'), wraplength=350).pack(pady=(10, 20))
+            
+            # Add loading message
+            ttk.Label(loading_frame, text="Finding personalized book recommendations...", 
+                    font=('Arial', 11)).pack(pady=(0, 15))
+            
+            # Add a progress bar
+            progress = ttk.Progressbar(loading_frame, orient="horizontal", 
+                                     length=300, mode="indeterminate")
+            progress.pack(pady=(0, 20))
+            progress.start(10)  # Start the animation
+            
+            # Make sure the loading window is displayed and animation starts
+            loading_window.update()
+            
+            # Import threading module for background processing
+            import threading
+            
+            # Function to get recommendations and show the window
+            def get_and_show_recommendations():
+                try:
+                    # Get book recommendations - this can be slow so we run it in background
+                    similar_books = get_similar_books(self.db, book_id)
+                    user_recommendations = []
+                    
+                    if student_id:
+                        user_recommendations = get_book_recommendations(self.db, student_id)
+                    
+                    # Schedule UI update on the main thread
+                    loading_window.after(0, lambda: show_results(similar_books, user_recommendations))
+                    
+                except Exception as e:
+                    # In case of error, schedule error handling on the main thread
+                    loading_window.after(0, lambda: handle_error(e))
+            
+            # Function to show results (must be called on main thread)
+            def show_results(similar_books, user_recommendations):
+                try:
+                    # Destroy the loading window
+                    loading_window.destroy()
+                    
+                    # Show the recommendations window
+                    self.show_return_success_with_recommendations(
+                        book_title,
+                        similar_books,
+                        user_recommendations
+                    )
+                except Exception as e:
+                    handle_error(e)
+            
+            # Function to handle errors (must be called on main thread)
+            def handle_error(e):
+                try:
+                    # Destroy the loading window if it exists
+                    if loading_window.winfo_exists():
+                        loading_window.destroy()
+                    
+                    print(f"Error getting recommendations: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    messagebox.showerror("Error", f"An error occurred while getting recommendations: {str(e)}")
+                    
+                    # Show empty recommendations
+                    self.show_return_success_with_recommendations(book_title, [], [])
+                except Exception as inner_e:
+                    print(f"Error in error handler: {inner_e}")
+            
+            # Keep animation running while waiting for thread
+            def keep_animation_alive():
+                if loading_window.winfo_exists():
+                    loading_window.update()
+                    # Schedule next update
+                    loading_window.after(100, keep_animation_alive)
+            
+            # Start the animation updater
+            loading_window.after(50, keep_animation_alive)
+            
+            # Start the thread to get recommendations
+            thread = threading.Thread(target=get_and_show_recommendations)
+            thread.daemon = True  # Make thread exit when main program exits
+            thread.start()
+            
+        except Exception as e:
+            print(f"Error processing recommendations: {e}")
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"An error occurred while processing recommendations: {str(e)}")
+            
+            # Schedule showing the recommendations window on the main thread
+            self.root.after(0, lambda: self.show_return_success_with_recommendations(
+                book_title,
+                [],  # Empty recommendations on error
+                []
+            ))
     
     def show_return_success_with_recommendations(self, book_title, similar_books, user_recommendations):
         """Show combined success message and book recommendations in one window"""
@@ -706,6 +846,7 @@ class LibraryUI:
             rec_window.geometry("550x500")
             rec_window.transient(self.root)  # Set as transient to main window
             rec_window.grab_set()  # Make window modal
+            rec_window.protocol("WM_DELETE_WINDOW", lambda: self._close_recommendation_window(rec_window))
             
             # Create main frame with padding
             main_frame = ttk.Frame(rec_window, padding=20)
@@ -860,15 +1001,16 @@ class LibraryUI:
             canvas.pack(side="left", fill="both", expand=True)
             scrollbar.pack(side="right", fill="y")
             
-            # Close button
-            ttk.Button(rec_window, text="Close", command=rec_window.destroy).pack(pady=(0, 10))
+            # Close button with custom callback
+            ttk.Button(rec_window, text="Close", 
+                     command=lambda: self._close_recommendation_window(rec_window)).pack(pady=(0, 10))
+            
+            # Store the window reference
+            self.recommendation_window = rec_window
             
             # Make sure window appears on top and gets focus
             rec_window.lift()
             rec_window.focus_force()
-            
-            # Flag to indicate the window has been shown
-            self.recommendation_window_shown = True
             
             # Wait for the window to be closed before proceeding
             self.root.wait_window(rec_window)
@@ -878,6 +1020,17 @@ class LibraryUI:
             import traceback
             traceback.print_exc()
             messagebox.showinfo("Success", f"Book '{book_title}' has been returned successfully.")
+            
+    def _close_recommendation_window(self, window):
+        """Custom close handler for recommendation window"""
+        # Set a flag to indicate the window is being closed
+        self.recommendation_window_closed = True
+        
+        # Destroy the window
+        window.destroy()
+        
+        # Refresh the return UI now that the recommendations are closed
+        self.show_return_ui()
     
     def show_check_books_ui(self):
         """Show interface to check books lent to a student"""

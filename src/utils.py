@@ -197,111 +197,210 @@ def recommend_recharge_amount(spending_pattern):
     recommendation = spending_pattern['weekly_avg'] * 2
     return round(recommendation / 100) * 100
 
-def get_similar_books(db, book_id):
+def get_similar_books(db, book_id, max_recommendations=3):
     """Get similar books based on lending history ("users who read this also read") or category"""
     try:
-        # First, get the current book's details
+        # Use a cache to store similar book recommendations - check if we have it in memory
+        if hasattr(get_similar_books, 'cache') and book_id in get_similar_books.cache:
+            # Return cached results if they're less than 1 hour old
+            cache_time, cached_results = get_similar_books.cache[book_id]
+            if (datetime.datetime.now() - cache_time).seconds < 3600:  # 1 hour cache
+                return cached_results
+        
+        # First get the current book's details - look up directly by ID first (most efficient)
         book_ref = db.collection('books').document(book_id)
         book_doc = book_ref.get()
         
+        # If not found by document ID, try the book_id field
         if not book_doc.exists:
-            # Try to search by the book_id field instead of document ID
+            # Use a more restrictive query to improve performance
             books_query = db.collection('books').where(
                 filter=firestore.FieldFilter('book_id', '==', book_id)
             ).limit(1)
-            book_results = list(books_query.get())
-            if not book_results:
-                return []
-            book_doc = book_results[0]
             
+            books_results = list(books_query.get())
+            if not books_results:
+                # If we can't find the book, return empty recommendations
+                return []
+            book_doc = books_results[0]
+        
         current_book = book_doc.to_dict()
         current_category = current_book.get('category')
+        category_recommendations = []
         
-        # Get lending history for this book
-        lending_ref = db.collection('lendings')
-        query = lending_ref.where(
-            filter=firestore.FieldFilter('book_id', '==', book_id)
-        ).where(
-            filter=firestore.FieldFilter('status', '==', 'returned')
-        )
+        # Track all book IDs to avoid duplicates
+        all_book_ids = set([book_id, book_doc.id])
+        if 'book_id' in current_book:
+            all_book_ids.add(current_book['book_id'])
         
-        lending_results = list(query.get())
-        
-        # If no results found, try with the document ID
-        if not lending_results:
-            query = lending_ref.where(
-                filter=firestore.FieldFilter('book_id', '==', book_doc.id)
-            ).where(
-                filter=firestore.FieldFilter('status', '==', 'returned')
-            )
-            lending_results = list(query.get())
-        
-        student_ids = set()
-        
-        # Collect student IDs who have borrowed this book
-        for doc in lending_results:
-            student_id = doc.to_dict().get('student_id')
-            if student_id:
-                student_ids.add(student_id)
-        
-        similar_books = []
-        book_scores = {}  # book_id -> score
-        
-        if student_ids:
-            # Find other books borrowed by these students - "users who read this also read"
-            for student_id in student_ids:
-                student_query = lending_ref.where(
-                    filter=firestore.FieldFilter('student_id', '==', student_id)
-                ).where(
-                    filter=firestore.FieldFilter('status', '==', 'returned')
-                )
-                
-                for doc in student_query.get():
-                    lending_data = doc.to_dict()
-                    other_book_id = lending_data.get('book_id')
-                    if other_book_id and other_book_id != book_id and other_book_id != book_doc.id:
-                        if other_book_id not in book_scores:
-                            book_scores[other_book_id] = 0
-                        book_scores[other_book_id] += 1
-            
-            # Sort books by how many students borrowed them
-            sorted_books = sorted(book_scores.items(), key=lambda x: x[1], reverse=True)
-            
-            # Get book details for the most frequently borrowed books
-            for other_book_id, score in sorted_books[:5]:  # Get top 5
-                other_book_ref = db.collection('books').document(other_book_id)
-                other_book_doc = other_book_ref.get()
-                
-                if other_book_doc.exists:
-                    other_book = other_book_doc.to_dict()
-                    other_book['id'] = other_book_doc.id
-                    if other_book.get('available', True):  # Only recommend available books
-                        similar_books.append(other_book)
-        
-        # If we don't have enough recommendations from lending history,
-        # fall back to category-based recommendations
-        if len(similar_books) < 3 and current_category:
+        # Get category recommendations first - we'll use these as fallback
+        if current_category:
+            # Get books in the same category - limit to 10 for performance
             category_query = db.collection('books').where(
                 filter=firestore.FieldFilter('category', '==', current_category)
             ).where(
                 filter=firestore.FieldFilter('available', '==', True)
             ).limit(10)
             
+            category_books = []
             for doc in category_query.get():
                 book_data = doc.to_dict()
-                book_data['id'] = doc.id
-                book_doc_id = doc.id
-                doc_book_id = book_data.get('book_id', book_doc_id)
+                doc_id = doc.id
                 
-                # Skip the current book and books already in similar_books
-                if (doc_book_id != book_id and book_doc_id != book_id and 
-                    not any(b.get('id') == book_doc_id for b in similar_books)):
-                    similar_books.append(book_data)
+                # Skip the current book
+                if doc_id in all_book_ids or book_data.get('book_id') in all_book_ids:
+                    continue
+                
+                book_data['id'] = doc_id
+                category_books.append(book_data)
+            
+            # Randomly select up to max_recommendations books from the same category
+            if category_books:
+                if len(category_books) > max_recommendations:
+                    category_recommendations = random.sample(category_books, max_recommendations)
+                else:
+                    category_recommendations = category_books
         
-        # Randomly select 3 books if we have more
-        if len(similar_books) > 3:
-            return random.sample(similar_books, 3)
-        return similar_books
+        # Get based on lending history - BUT limit queries to improve performance
+        # Use a single query instead of multiple queries
+        lending_query = db.collection('lendings').where(
+            filter=firestore.FieldFilter('book_id', '==', book_id)
+        ).where(
+            filter=firestore.FieldFilter('status', '==', 'returned')
+        ).limit(5)  # Limit to 5 most recent
+        
+        lending_results = list(lending_query.get())
+        
+        # If no results found by book_id, try the document ID
+        if not lending_results and book_doc.id != book_id:
+            lending_query = db.collection('lendings').where(
+                filter=firestore.FieldFilter('book_id', '==', book_doc.id)
+            ).where(
+                filter=firestore.FieldFilter('status', '==', 'returned')
+            ).limit(5)
+            lending_results = list(lending_query.get())
+        
+        # If we have lending history
+        if lending_results:
+            student_ids = set()
+            
+            # Collect student IDs who have borrowed this book
+            for doc in lending_results:
+                student_id = doc.to_dict().get('student_id')
+                if student_id:
+                    student_ids.add(student_id)
+            
+            # If we have students who borrowed this book
+            if student_ids:
+                book_counts = {}  # book_id -> count
+                book_data_map = {}  # book_id -> book_data
+                
+                # Only query for a few students to improve performance
+                sample_students = list(student_ids)
+                if len(sample_students) > 3:
+                    sample_students = random.sample(sample_students, 3)
+                
+                # Get books borrowed by these students in a single batch
+                for student_id in sample_students:
+                    # Only get returned books (completed reading)
+                    student_query = db.collection('lendings').where(
+                        filter=firestore.FieldFilter('student_id', '==', student_id)
+                    ).where(
+                        filter=firestore.FieldFilter('status', '==', 'returned')
+                    ).limit(10)  # Limit to 10 most recent books
+                    
+                    for doc in student_query.get():
+                        lending_data = doc.to_dict()
+                        other_book_id = lending_data.get('book_id')
+                        
+                        # Skip current book and already processed IDs
+                        if not other_book_id or other_book_id in all_book_ids:
+                            continue
+                        
+                        # Count occurrences
+                        if other_book_id not in book_counts:
+                            book_counts[other_book_id] = 0
+                        book_counts[other_book_id] += 1
+                
+                # If we found books borrowed by similar users
+                if book_counts:
+                    # Sort books by popularity
+                    sorted_books = sorted(book_counts.items(), key=lambda x: x[1], reverse=True)
+                    
+                    # Check availability and get details for top books
+                    similar_books = []
+                    checked_books = 0
+                    
+                    # Only check up to 10 books for performance
+                    for other_book_id, _ in sorted_books[:10]:
+                        if checked_books >= 10:  # Performance limit
+                            break
+                        checked_books += 1
+                        
+                        other_book_ref = db.collection('books').document(other_book_id)
+                        other_book_doc = other_book_ref.get()
+                        
+                        if other_book_doc.exists:
+                            other_book = other_book_doc.to_dict()
+                            other_book['id'] = other_book_doc.id
+                            
+                            # Only include available books
+                            if other_book.get('available', True):
+                                similar_books.append(other_book)
+                                
+                                # Stop once we have enough recommendations
+                                if len(similar_books) >= max_recommendations:
+                                    break
+                    
+                    # If we found recommendations based on lending history
+                    if similar_books:
+                        # Cache the results
+                        if not hasattr(get_similar_books, 'cache'):
+                            get_similar_books.cache = {}
+                        get_similar_books.cache[book_id] = (datetime.datetime.now(), similar_books)
+                        return similar_books
+        
+        # If we get here, use category recommendations as fallback
+        if category_recommendations:
+            # Cache the results
+            if not hasattr(get_similar_books, 'cache'):
+                get_similar_books.cache = {}
+            get_similar_books.cache[book_id] = (datetime.datetime.now(), category_recommendations)
+            return category_recommendations
+        
+        # Last resort: get random books
+        try:
+            books_ref = db.collection('books').where(
+                filter=firestore.FieldFilter('available', '==', True)
+            ).limit(max_recommendations * 2)
+            
+            random_books = []
+            for doc in books_ref.get():
+                book_data = doc.to_dict()
+                doc_id = doc.id
+                
+                # Skip the current book
+                if doc_id in all_book_ids or book_data.get('book_id') in all_book_ids:
+                    continue
+                
+                book_data['id'] = doc_id
+                random_books.append(book_data)
+            
+            # Randomly select a few recommendations
+            if random_books:
+                if len(random_books) > max_recommendations:
+                    random_books = random.sample(random_books, max_recommendations)
+                
+                # Cache the results
+                if not hasattr(get_similar_books, 'cache'):
+                    get_similar_books.cache = {}
+                get_similar_books.cache[book_id] = (datetime.datetime.now(), random_books)
+                return random_books
+        except Exception as e:
+            print(f"Error getting random books: {e}")
+        
+        # If all else fails, return empty list
+        return []
         
     except Exception as e:
         print(f"Error getting similar books: {e}")
@@ -309,70 +408,135 @@ def get_similar_books(db, book_id):
         traceback.print_exc()
         return []
 
-def get_book_recommendations(db, student_id):
+def get_book_recommendations(db, student_id, max_recommendations=3):
     """Get personalized book recommendations based on student's reading history"""
     try:
-        # Get student's lending history
-        lending_ref = db.collection('lendings')
-        query = lending_ref.where(
+        # Use a cache to store user recommendations
+        if hasattr(get_book_recommendations, 'cache') and student_id in get_book_recommendations.cache:
+            # Return cached results if they're less than 1 hour old
+            cache_time, cached_results = get_book_recommendations.cache[student_id]
+            if (datetime.datetime.now() - cache_time).seconds < 3600:  # 1 hour cache
+                return cached_results
+        
+        # Get student's lending history - limit to 10 most recent for performance
+        lending_query = db.collection('lendings').where(
             filter=firestore.FieldFilter('student_id', '==', student_id)
         ).where(
             filter=firestore.FieldFilter('status', '==', 'returned')
-        )
+        ).limit(10)  # Only get 10 most recent books
         
-        lending_results = query.get()
+        lending_results = list(lending_query.get())
         if not lending_results:
             return []
         
         # Collect categories of books the student has read and the book IDs they've read
         read_categories = set()
         read_book_ids = set()
+        category_counts = {}  # Track which categories the student reads most
         
         for doc in lending_results:
             lending_data = doc.to_dict()
             book_id = lending_data.get('book_id')
             if book_id:
                 read_book_ids.add(book_id)
+                
+                # Get book details
                 book_ref = db.collection('books').document(book_id)
                 book_doc = book_ref.get()
+                
                 if book_doc.exists:
                     book_data = book_doc.to_dict()
                     category = book_data.get('category')
+                    
                     if category:
                         read_categories.add(category)
+                        
+                        # Count category occurrences to prioritize favorite categories
+                        if category not in category_counts:
+                            category_counts[category] = 0
+                        category_counts[category] += 1
         
         if not read_categories:
             return []
         
-        # Get recommendations from the same categories
+        # Prioritize categories by frequency
+        sorted_categories = sorted(category_counts.items(), key=lambda x: x[1], reverse=True)
+        prioritized_categories = [cat for cat, _ in sorted_categories]
+        
+        # Get recommendations from the student's preferred categories
         recommendations = []
-        for category in read_categories:
+        books_per_category = max(1, max_recommendations // len(prioritized_categories))
+        
+        for category in prioritized_categories:
+            # Limit to a small number per category for performance
             category_query = db.collection('books').where(
                 filter=firestore.FieldFilter('category', '==', category)
             ).where(
                 filter=firestore.FieldFilter('available', '==', True)
-            ).limit(10)  # Get more books per category for better randomization
+            ).limit(5)
             
+            category_books = []
             for doc in category_query.get():
                 book_data = doc.to_dict()
-                book_data['id'] = doc.id
-                book_doc_id = doc.id
-                doc_book_id = book_data.get('book_id', book_doc_id)
+                book_id = doc.id
                 
                 # Don't recommend books the student has already read
-                if doc_book_id not in read_book_ids and book_doc_id not in read_book_ids:
-                    recommendations.append(book_data)
+                if book_id in read_book_ids or book_data.get('book_id') in read_book_ids:
+                    continue
+                
+                book_data['id'] = book_id
+                category_books.append(book_data)
+            
+            # Add some books from this category
+            if category_books:
+                if len(category_books) > books_per_category:
+                    selected_books = random.sample(category_books, books_per_category)
+                else:
+                    selected_books = category_books
+                
+                recommendations.extend(selected_books)
+            
+            # Stop once we have enough recommendations
+            if len(recommendations) >= max_recommendations:
+                break
         
-        # Randomly select 3 books if we have more
-        if len(recommendations) > 3:
-            return random.sample(recommendations, 3)
+        # If we still need more recommendations, add random books
+        if len(recommendations) < max_recommendations:
+            available_query = db.collection('books').where(
+                filter=firestore.FieldFilter('available', '==', True)
+            ).limit(10)
+            
+            for doc in available_query.get():
+                book_data = doc.to_dict()
+                book_id = doc.id
+                
+                # Skip books that are already in recommendations or read by student
+                if book_id in read_book_ids or book_data.get('book_id') in read_book_ids:
+                    continue
+                
+                if not any(r.get('id') == book_id for r in recommendations):
+                    book_data['id'] = book_id
+                    recommendations.append(book_data)
+                    
+                    if len(recommendations) >= max_recommendations:
+                        break
+        
+        # Limit to max_recommendations
+        if len(recommendations) > max_recommendations:
+            recommendations = recommendations[:max_recommendations]
+        
+        # Cache the results
+        if not hasattr(get_book_recommendations, 'cache'):
+            get_book_recommendations.cache = {}
+        get_book_recommendations.cache[student_id] = (datetime.datetime.now(), recommendations)
+            
         return recommendations
         
     except Exception as e:
         print(f"Error getting book recommendations: {e}")
         import traceback
         traceback.print_exc()
-        return []
+        return [] 
 
 # Face Recognition Utilities
 def capture_face(camera_index=0, required_encodings=7):
